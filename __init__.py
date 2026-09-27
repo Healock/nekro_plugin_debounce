@@ -52,7 +52,6 @@ class DebounceConfig(ConfigBase):
         title="新消息时取消旧回复",
         description="保留 AstrBot 配置字段；Nekro v0.1.0 不伪造 Agent 取消。",
     )
-    debug_mode: bool = Field(default=False, title="调试日志")
 
 
 config = plugin.get_config(DebounceConfig)

@@ -23,6 +23,16 @@ class Message:
     content_data: list[dict] = field(default_factory=list)
 
 
+def test_compat_config_fields_and_defaults() -> None:
+    config = DebounceConfig()
+    assert config.model_type == "small"
+    assert config.send_threshold == 0.8
+    assert config.timeout_seconds == 10
+    assert config.usage_scope == "both"
+    assert config.cancel_on_new_message is True
+    assert "debug_mode" not in DebounceConfig.model_fields
+
+
 @pytest.mark.asyncio
 async def test_incomplete_then_complete_marks_outer_commit_uncertain() -> None:
     from nekro_plugin_debounce import plugin
