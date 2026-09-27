@@ -101,13 +101,15 @@ def merge_into_message(message: Any, envelopes: Sequence[Any]) -> None:
         for item in envelopes
     ]
     text_parts.append(current_text)
-    message.content_text = merge_text(text_parts)
+    merged_text = merge_text(text_parts)
 
     segment_dicts: list[dict[str, Any]] = []
     for item in envelopes:
         segment_dicts.extend(content_data_to_dicts(getattr(item, "content_data", [])))
     segment_dicts.extend(content_data_to_dicts(getattr(message, "content_data", [])))
-    message.content_data = restore_segments(segment_dicts)
+    merged_segments = restore_segments(segment_dicts)
+    message.content_text = merged_text
+    message.content_data = merged_segments
 
 
 def usage_scope_matches(message: Any, usage_scope: str) -> bool:

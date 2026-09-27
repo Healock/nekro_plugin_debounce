@@ -25,6 +25,10 @@ from .state import ChatBuffer, JournalRecord, JournalState, MessageEnvelope
 from .tasks import TaskManager
 
 
+MAX_TIMEOUT_STATE_RETRIES = 3
+TIMEOUT_RETRY_DELAY_SECONDS = 1.0
+
+
 class DebounceRuntime:
     def __init__(self, plugin: Any, config: Any) -> None:
         self.plugin = plugin
@@ -39,6 +43,7 @@ class DebounceRuntime:
         self.tasks = TaskManager(self._on_timeout, logger=plugin.logger)
         self._started = False
         self._stopping = False
+        self._timeout_state_failures: dict[tuple[str, int], int] = {}
 
     @property
     def logger(self) -> Any:
@@ -122,8 +127,12 @@ class DebounceRuntime:
             if not current_text.strip() and not getattr(message, "content_data", None):
                 return MsgSignal.CONTINUE
 
+            # AstrBot 在已有 pending 时会直接合并下一条文本，避免再次分类导致持续阻塞。
+            if current_buffer is not None and current_buffer.messages:
+                return await self._merge_and_trigger(message, current_buffer, "pending_text")
+
             candidate = merge_text(
-                [current_buffer.text if current_buffer is not None else "", current_text],
+                [current_text],
             )
             try:
                 complete = await self.classifier.is_complete(candidate, float(self.config.send_threshold))
@@ -193,6 +202,12 @@ class DebounceRuntime:
             merge_into_message(message, buffer.messages)
         except Exception as exc:
             self.logger.exception(f"[Debounce] 消息合并失败，当前消息 fail-open，pending 保留: {exc}")
+            try:
+                await self.journal.mark_manual_recovery(buffer.record_ids, f"merge_failed:{reason}")
+                self.buffers.clear(buffer.chat_key, buffer.generation)
+                self.tasks.cancel(buffer.chat_key, buffer.generation)
+            except JournalError as journal_exc:
+                self.logger.exception(f"[Debounce] 合并失败批次无法标记人工恢复: {journal_exc}")
             return MsgSignal.CONTINUE
         self.buffers.clear(buffer.chat_key, buffer.generation)
         self.tasks.cancel(buffer.chat_key, buffer.generation)
@@ -206,19 +221,44 @@ class DebounceRuntime:
     async def _on_timeout(self, chat_key: str, generation: int) -> None:
         lock = self.buffers.lock_for(chat_key)
         async with lock:
-            buffer = self.buffers.take(chat_key, generation)
-            if buffer is None or not buffer.messages:
+            buffer = self.buffers.get(chat_key)
+            if buffer is None or buffer.generation != generation or not buffer.messages:
                 return
             record_ids = buffer.record_ids
             try:
                 await self.journal.mark_flushing(record_ids)
             except JournalError as exc:
-                self.logger.exception(f"[Debounce] timeout 状态写入失败，转人工恢复: {exc}")
+                key = (chat_key, generation)
+                failures = self._timeout_state_failures.get(key, 0) + 1
+                self._timeout_state_failures[key] = failures
+                self.logger.exception(f"[Debounce] timeout 状态写入失败，第 {failures} 次: {exc}")
                 try:
-                    await self.journal.mark_manual_recovery(record_ids, "timeout_state_write_failed")
-                except JournalError:
-                    pass
+                    await self.journal.transition(
+                        record_ids,
+                        JournalState.PENDING,
+                        error_state="timeout_state_write_failed",
+                        increment_retries=True,
+                    )
+                except JournalError as journal_exc:
+                    self.logger.exception(f"[Debounce] timeout 失败状态写入失败: {journal_exc}")
+                if failures <= MAX_TIMEOUT_STATE_RETRIES:
+                    retry_at = time.time() + TIMEOUT_RETRY_DELAY_SECONDS * failures
+                    try:
+                        self.tasks.schedule(chat_key, generation, retry_at)
+                    except Exception as retry_exc:
+                        self.logger.exception(f"[Debounce] timeout 有限重试创建失败: {retry_exc}")
+                else:
+                    try:
+                        await self.journal.mark_manual_recovery(record_ids, "timeout_state_write_exhausted")
+                        self.buffers.clear(chat_key, generation)
+                    except JournalError as journal_exc:
+                        self.logger.exception(f"[Debounce] timeout 达到重试上限且无法标记人工恢复: {journal_exc}")
                 return
+
+            buffer = self.buffers.take(chat_key, generation)
+            if buffer is None or not buffer.messages:
+                return
+            self._timeout_state_failures.pop((chat_key, generation), None)
 
             try:
                 from nekro_agent.api.message import push_system

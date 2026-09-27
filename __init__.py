@@ -17,6 +17,7 @@ plugin = NekroPlugin(
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
+    allow_sleep=False,
 )
 
 

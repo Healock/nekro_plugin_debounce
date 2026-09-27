@@ -19,7 +19,10 @@ class TaskManager:
 
     def schedule(self, chat_key: str, generation: int, timeout_at: float) -> asyncio.Task[None]:
         key = (chat_key, generation)
-        self.cancel(chat_key, generation)
+        current_task = asyncio.current_task()
+        existing = self._tasks.get(key)
+        if existing is not None and existing is not current_task:
+            self.cancel(chat_key, generation)
         coroutine = self._run(key, timeout_at)
         try:
             task = asyncio.create_task(coroutine, name=f"debounce-timeout:{chat_key}:{generation}")

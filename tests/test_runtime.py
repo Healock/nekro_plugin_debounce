@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from nekro_plugin_debounce import DebounceConfig
+from nekro_plugin_debounce import DebounceConfig, lifecycle as lifecycle_module
+from nekro_plugin_debounce.journal import JournalError
 from nekro_plugin_debounce.lifecycle import DebounceRuntime
 from nekro_plugin_debounce.state import JournalRecord
 from nekro_plugin_debounce.state import JournalState
@@ -69,6 +70,120 @@ async def test_media_boundary_merges_without_classifier() -> None:
     assert (await runtime.handle_user_message(None, media)).name == "FORCE_TRIGGER"
     assert media.content_text == "先说 图片"
     assert [item["type"] for item in media.content_data] == ["text", "image"]
+
+
+@pytest.mark.asyncio
+async def test_pending_text_triggers_without_second_classification() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    config = DebounceConfig(timeout_seconds=0)
+    runtime = DebounceRuntime(plugin, config)
+    calls = 0
+
+    async def incomplete(*_args):
+        nonlocal calls
+        calls += 1
+        return False
+
+    runtime.classifier.is_complete = incomplete  # type: ignore[method-assign]
+    first = Message(message_id="pending-1", content_text="第一段", content_data=[{"type": "text", "text": "第一段"}])
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+    second = Message(message_id="pending-2", content_text="第二段", content_data=[{"type": "text", "text": "第二段"}])
+    assert (await runtime.handle_user_message(None, second)).name == "FORCE_TRIGGER"
+    assert second.content_text == "第一段 第二段"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_state_failure_keeps_buffer_and_schedules_retry() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    config = DebounceConfig(timeout_seconds=0)
+    runtime = DebounceRuntime(plugin, config)
+
+    async def incomplete(*_args):
+        return False
+
+    runtime.classifier.is_complete = incomplete  # type: ignore[method-assign]
+    first = Message(message_id="timeout-1", content_text="等待", content_data=[{"type": "text", "text": "等待"}])
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+
+    async def fail_mark(_ids):
+        raise JournalError("store unavailable")
+
+    runtime.journal.mark_flushing = fail_mark  # type: ignore[method-assign]
+    await runtime._on_timeout("chat", 0)
+    assert runtime.buffers.has_pending("chat")
+    assert ("chat", 0) in runtime.tasks.tasks
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_merge_failure_marks_manual_recovery() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    config = DebounceConfig(timeout_seconds=0)
+    runtime = DebounceRuntime(plugin, config)
+
+    async def incomplete(*_args):
+        return False
+
+    runtime.classifier.is_complete = incomplete  # type: ignore[method-assign]
+    first = Message(message_id="merge-1", content_text="旧文本", content_data=[{"type": "text", "text": "旧文本"}])
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+
+    def fail_merge(*_args, **_kwargs):
+        raise ValueError("invalid content")
+
+    original_merge = lifecycle_module.merge_into_message
+    lifecycle_module.merge_into_message = fail_merge
+    try:
+        second = Message(message_id="merge-2", content_text="新文本", content_data=[{"type": "text", "text": "新文本"}])
+        assert (await runtime.handle_user_message(None, second)).name == "CONTINUE"
+    finally:
+        lifecycle_module.merge_into_message = original_merge
+    records = await runtime.journal.records()
+    assert records[0].state == JournalState.MANUAL_RECOVERY
+
+
+@pytest.mark.asyncio
+async def test_append_failure_fails_open() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    config = DebounceConfig(timeout_seconds=0)
+    runtime = DebounceRuntime(plugin, config)
+
+    async def incomplete(*_args):
+        return False
+
+    async def fail_append(_record):
+        raise JournalError("store unavailable")
+
+    runtime.classifier.is_complete = incomplete  # type: ignore[method-assign]
+    runtime.journal.append = fail_append  # type: ignore[method-assign]
+    message = Message(message_id="append-fail", content_text="直接放行", content_data=[{"type": "text", "text": "直接放行"}])
+    assert (await runtime.handle_user_message(None, message)).name == "CONTINUE"
+    assert not runtime.buffers.has_pending("chat")
+
+
+@pytest.mark.asyncio
+async def test_classifier_failure_fails_open() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    config = DebounceConfig(timeout_seconds=0)
+    runtime = DebounceRuntime(plugin, config)
+
+    async def fail_classify(*_args):
+        raise RuntimeError("model unavailable")
+
+    runtime.classifier.is_complete = fail_classify  # type: ignore[method-assign]
+    message = Message(message_id="classifier-fail", content_text="直接放行", content_data=[{"type": "text", "text": "直接放行"}])
+    assert (await runtime.handle_user_message(None, message)).name == "CONTINUE"
 
 
 @pytest.mark.asyncio
