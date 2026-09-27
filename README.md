@@ -1,8 +1,13 @@
-# NekroAgent 消息防抖（AstrBot 兼容迁移版）
+# NekroAgent 消息防抖
 
 版本：`0.1.0`
 
-本插件将 AstrBot 消息防抖的主要用户体验移植到 NekroAgent：连续发送的文本先按频道缓冲，由 ONNX 完整性模型判断是否已经说完；未完整消息不会触发 Agent，完整消息合并后只触发一次。
+本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
+
+- 原作者：`advent259141`
+- 原仓库：[advent259141/astrbot_plugin_debounce](https://github.com/advent259141/astrbot_plugin_debounce)
+
+连续发送的文本先按频道缓冲，由 ONNX 完整性模型判断是否已经说完；未完整消息不会触发 Agent，完整消息合并后只触发一次。
 
 ## 兼容配置
 
