@@ -12,10 +12,13 @@ from .classifier import ClassifierAdapter
 from .compat import (
     content_data_to_dicts,
     has_hard_boundary,
+    is_replay_message,
     merge_into_message,
     merge_text,
     message_event_id,
     message_id,
+    REPLAY_MARKER,
+    restore_segments,
     sender_id,
     sender_name,
     usage_scope_matches,
@@ -87,6 +90,10 @@ class DebounceRuntime:
                     content_data=record.content_data,
                     sender_id=record.sender_id,
                     sender_name=record.sender_name,
+                    sender_nickname=record.sender_nickname,
+                    adapter_key=record.adapter_key,
+                    platform_userid=record.platform_userid,
+                    raw_cq_code=record.raw_cq_code,
                 ),
             )
         pending_by_key = {
@@ -110,6 +117,8 @@ class DebounceRuntime:
 
     async def handle_user_message(self, _ctx: Any, message: Any) -> MsgSignal:
         if self._stopping or not self.config.enabled or not usage_scope_matches(message, self.config.usage_scope):
+            return MsgSignal.CONTINUE
+        if is_replay_message(message):
             return MsgSignal.CONTINUE
 
         chat_key = str(getattr(message, "chat_key", "") or "")
@@ -160,6 +169,10 @@ class DebounceRuntime:
                 last_message_id=message_id(message),
                 sender_id=sender_id(message),
                 sender_name=sender_name(message),
+                sender_nickname=str(getattr(message, "sender_nickname", "") or ""),
+                adapter_key=str(getattr(message, "adapter_key", "") or ""),
+                platform_userid=str(getattr(message, "platform_userid", "") or ""),
+                raw_cq_code=str(getattr(message, "raw_cq_code", "") or ""),
                 updated_at=time.time(),
                 timeout_at=timeout_at,
             )
@@ -179,6 +192,10 @@ class DebounceRuntime:
                 content_data=record.content_data,
                 sender_id=record.sender_id,
                 sender_name=record.sender_name,
+                sender_nickname=record.sender_nickname,
+                adapter_key=record.adapter_key,
+                platform_userid=record.platform_userid,
+                raw_cq_code=record.raw_cq_code,
             )
             self.buffers.add(envelope, timeout_at)
             if self.config.timeout_seconds > 0:
@@ -261,13 +278,11 @@ class DebounceRuntime:
             self._timeout_state_failures.pop((chat_key, generation), None)
 
             try:
-                from nekro_agent.api.message import push_system
-
-                await push_system(chat_key, buffer.text, trigger_agent=True)
+                await self._replay_as_human_message(buffer)
             except Exception as exc:
-                self.logger.exception(f"[Debounce] timeout push_system 不确定，禁止自动重试: {exc}")
+                self.logger.exception(f"[Debounce] timeout 用户消息重放失败，保留人工恢复记录: {exc}")
                 try:
-                    await self.journal.mark_manual_recovery(record_ids, "timeout_push_uncertain")
+                    await self.journal.mark_manual_recovery(record_ids, "timeout_human_replay_failed")
                 except JournalError:
                     pass
                 return
@@ -276,6 +291,42 @@ class DebounceRuntime:
                 await self.journal.acknowledge(record_ids)
             except JournalError as exc:
                 self.logger.exception(f"[Debounce] timeout 已调用但 journal 清理失败: {exc}")
+
+    async def _replay_as_human_message(self, buffer: ChatBuffer) -> None:
+        """将超时缓冲重新交给用户消息入口，避免生成 SYSTEM 消息。"""
+
+        from nekro_agent.models.db_chat_channel import DBChatChannel
+        from nekro_agent.schemas.chat_message import ChatMessage, ChatType
+        from nekro_agent.services.message_service import message_service
+
+        channel = await DBChatChannel.get_channel(chat_key=buffer.chat_key)
+        last_message = buffer.messages[-1]
+        content_data = []
+        for item in buffer.messages:
+            content_data.extend(content_data_to_dicts(item.content_data))
+
+        message = ChatMessage(
+            message_id=f"debounce-{buffer.generation}-{last_message.message_id or last_message.event_id}",
+            sender_id=last_message.sender_id or "0",
+            sender_name=last_message.sender_name or "未知用户",
+            sender_nickname=last_message.sender_nickname or last_message.sender_name or "未知用户",
+            adapter_key=last_message.adapter_key or channel.adapter_key,
+            platform_userid=last_message.platform_userid or "0",
+            is_tome=0,
+            is_recalled=False,
+            chat_key=buffer.chat_key,
+            chat_type=ChatType(channel.chat_type),
+            content_text=buffer.text,
+            content_data=restore_segments(content_data),
+            raw_cq_code=last_message.raw_cq_code,
+            ext_data={REPLAY_MARKER: True},
+            send_timestamp=int(time.time()),
+        )
+        await message_service.push_human_message(
+            message=message,
+            trigger_agent=True,
+            db_chat_channel=channel,
+        )
 
 
 def register_lifecycle(plugin: Any, runtime: DebounceRuntime) -> None:
