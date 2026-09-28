@@ -30,7 +30,8 @@ def test_compat_config_fields_and_defaults() -> None:
     assert config.timeout_seconds == 10
     assert config.usage_scope == "both"
     assert config.cancel_on_new_message is True
-    assert "debug_mode" not in DebounceConfig.model_fields
+    assert config.debounce_mode == "semantic"
+    assert config.debug_logging is False
 
 
 @pytest.mark.asyncio
@@ -103,6 +104,26 @@ async def test_pending_text_triggers_without_second_classification() -> None:
     assert (await runtime.handle_user_message(None, second)).name == "FORCE_TRIGGER"
     assert second.content_text == "第一段 第二段"
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_time_mode_waits_until_timeout_for_all_messages() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    config = DebounceConfig(debounce_mode="time", timeout_seconds=0)
+    runtime = DebounceRuntime(plugin, config)
+
+    async def fail_classify(*_args):
+        raise AssertionError("时间模式不应调用语义分类器")
+
+    runtime.classifier.is_complete = fail_classify  # type: ignore[method-assign]
+    first = Message(message_id="time-1", content_text="第一段", content_data=[{"type": "text", "text": "第一段"}])
+    second = Message(message_id="time-2", content_text="第二段", content_data=[{"type": "text", "text": "第二段"}])
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_ALL"
+    assert len(runtime.buffers.get("chat").messages) == 2  # type: ignore[union-attr]
+    assert len(await runtime.journal.records()) == 2
 
 
 @pytest.mark.asyncio

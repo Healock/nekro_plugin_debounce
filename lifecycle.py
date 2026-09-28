@@ -14,6 +14,7 @@ from .compat import (
     has_hard_boundary,
     is_replay_message,
     merge_into_message,
+    merge_message_content,
     merge_text,
     message_event_id,
     message_id,
@@ -42,6 +43,7 @@ class DebounceRuntime:
             model_type=config.model_type,
             data_dir=plugin.get_plugin_data_dir(),
             logger=plugin.logger,
+            debug_logging=config.debug_logging,
         )
         self.tasks = TaskManager(self._on_timeout, logger=plugin.logger)
         self._started = False
@@ -138,7 +140,12 @@ class DebounceRuntime:
 
             # AstrBot 在已有 pending 时会直接合并下一条文本，避免再次分类导致持续阻塞。
             if current_buffer is not None and current_buffer.messages:
+                if self.config.debounce_mode == "time":
+                    return await self._buffer_message(message)
                 return await self._merge_and_trigger(message, current_buffer, "pending_text")
+
+            if self.config.debounce_mode == "time":
+                return await self._buffer_message(message)
 
             candidate = merge_text(
                 [current_text],
@@ -156,63 +163,69 @@ class DebounceRuntime:
                     return MsgSignal.FORCE_TRIGGER
                 return await self._merge_and_trigger(message, current_buffer, "complete")
 
-            generation, sequence = self.buffers.next_position(chat_key)
-            event_id = message_event_id(message)
-            timeout_at = time.time() + max(0, int(self.config.timeout_seconds))
-            record = JournalRecord(
-                event_id=event_id,
-                chat_key=chat_key,
-                generation=generation,
-                sequence=sequence,
-                text=current_text,
-                content_data=content_data_to_dicts(getattr(message, "content_data", [])),
-                last_message_id=message_id(message),
-                sender_id=sender_id(message),
-                sender_name=sender_name(message),
-                sender_nickname=str(getattr(message, "sender_nickname", "") or ""),
-                adapter_key=str(getattr(message, "adapter_key", "") or ""),
-                platform_userid=str(getattr(message, "platform_userid", "") or ""),
-                raw_cq_code=str(getattr(message, "raw_cq_code", "") or ""),
-                updated_at=time.time(),
-                timeout_at=timeout_at,
-            )
-            try:
-                await self.journal.append(record)
-            except JournalError as exc:
-                self.logger.exception(f"[Debounce] BLOCK_ALL 前 journal 写入失败，当前消息放行: {exc}")
-                return MsgSignal.CONTINUE
+            return await self._buffer_message(message)
 
-            envelope = MessageEnvelope(
-                event_id=event_id,
-                message_id=message_id(message),
-                chat_key=chat_key,
-                generation=generation,
-                sequence=sequence,
-                text=current_text,
-                content_data=record.content_data,
-                sender_id=record.sender_id,
-                sender_name=record.sender_name,
-                sender_nickname=record.sender_nickname,
-                adapter_key=record.adapter_key,
-                platform_userid=record.platform_userid,
-                raw_cq_code=record.raw_cq_code,
-            )
-            self.buffers.add(envelope, timeout_at)
-            if self.config.timeout_seconds > 0:
+    async def _buffer_message(self, message: Any) -> MsgSignal:
+        """持久化一条待处理消息并从最后一条消息重新计算超时。"""
+
+        chat_key = str(getattr(message, "chat_key", "") or "")
+        generation, sequence = self.buffers.next_position(chat_key)
+        event_id = message_event_id(message)
+        timeout_at = time.time() + max(0, int(self.config.timeout_seconds))
+        record = JournalRecord(
+            event_id=event_id,
+            chat_key=chat_key,
+            generation=generation,
+            sequence=sequence,
+            text=str(getattr(message, "content_text", "") or ""),
+            content_data=content_data_to_dicts(getattr(message, "content_data", [])),
+            last_message_id=message_id(message),
+            sender_id=sender_id(message),
+            sender_name=sender_name(message),
+            sender_nickname=str(getattr(message, "sender_nickname", "") or ""),
+            adapter_key=str(getattr(message, "adapter_key", "") or ""),
+            platform_userid=str(getattr(message, "platform_userid", "") or ""),
+            raw_cq_code=str(getattr(message, "raw_cq_code", "") or ""),
+            updated_at=time.time(),
+            timeout_at=timeout_at,
+        )
+        try:
+            await self.journal.append(record)
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] BLOCK_ALL 前 journal 写入失败，当前消息放行: {exc}")
+            return MsgSignal.CONTINUE
+
+        envelope = MessageEnvelope(
+            event_id=event_id,
+            message_id=message_id(message),
+            chat_key=chat_key,
+            generation=generation,
+            sequence=sequence,
+            text=record.text,
+            content_data=record.content_data,
+            sender_id=record.sender_id,
+            sender_name=record.sender_name,
+            sender_nickname=record.sender_nickname,
+            adapter_key=record.adapter_key,
+            platform_userid=record.platform_userid,
+            raw_cq_code=record.raw_cq_code,
+        )
+        self.buffers.add(envelope, timeout_at)
+        if self.config.timeout_seconds > 0:
+            try:
+                self.tasks.schedule(chat_key, generation, timeout_at)
+            except Exception as exc:
+                self.logger.exception(f"[Debounce] timeout 创建失败，保留 journal 等待恢复: {exc}")
                 try:
-                    self.tasks.schedule(chat_key, generation, timeout_at)
-                except Exception as exc:
-                    self.logger.exception(f"[Debounce] timeout 创建失败，保留 journal 等待恢复: {exc}")
-                    try:
-                        await self.journal.transition(
-                            [event_id],
-                            JournalState.PENDING,
-                            error_state="timeout_task_creation_failed",
-                            increment_retries=True,
-                        )
-                    except JournalError as journal_exc:
-                        self.logger.exception(f"[Debounce] timeout 失败状态写入失败: {journal_exc}")
-            return MsgSignal.BLOCK_ALL
+                    await self.journal.transition(
+                        [event_id],
+                        JournalState.PENDING,
+                        error_state="timeout_task_creation_failed",
+                        increment_retries=True,
+                    )
+                except JournalError as journal_exc:
+                    self.logger.exception(f"[Debounce] timeout 失败状态写入失败: {journal_exc}")
+        return MsgSignal.BLOCK_ALL
 
     async def _merge_and_trigger(self, message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
         try:
@@ -301,9 +314,9 @@ class DebounceRuntime:
 
         channel = await DBChatChannel.get_channel(chat_key=buffer.chat_key)
         last_message = buffer.messages[-1]
-        content_data = []
-        for item in buffer.messages:
-            content_data.extend(content_data_to_dicts(item.content_data))
+        content_text, content_data = merge_message_content(
+            [(item.text, item.content_data) for item in buffer.messages],
+        )
 
         message = ChatMessage(
             message_id=f"debounce-{buffer.generation}-{last_message.message_id or last_message.event_id}",
@@ -316,7 +329,7 @@ class DebounceRuntime:
             is_recalled=False,
             chat_key=buffer.chat_key,
             chat_type=ChatType(channel.chat_type),
-            content_text=buffer.text,
+            content_text=content_text,
             content_data=restore_segments(content_data),
             raw_cq_code=last_message.raw_cq_code,
             ext_data={REPLAY_MARKER: True},

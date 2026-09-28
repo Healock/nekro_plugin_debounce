@@ -23,6 +23,11 @@ plugin = NekroPlugin(
 
 @plugin.mount_config()
 class DebounceConfig(ConfigBase):
+    debounce_mode: Literal["semantic", "time"] = Field(
+        default="semantic",
+        title="防抖模式",
+        description="semantic: 使用完整性模型；time: 仅等待固定时间后发送。",
+    )
     model_type: Literal["small", "normal"] = Field(
         default="small",
         title="模型类型",
@@ -51,6 +56,11 @@ class DebounceConfig(ConfigBase):
         default=True,
         title="新消息时取消旧回复",
         description="保留 AstrBot 配置字段；Nekro v0.1.1 不伪造 Agent 取消。",
+    )
+    debug_logging: bool = Field(
+        default=False,
+        title="启用调试日志",
+        description="开启后记录完整性概率、阈值和判定结果。",
     )
 
 

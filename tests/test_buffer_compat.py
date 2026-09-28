@@ -43,6 +43,26 @@ def test_media_is_hard_boundary_and_merge_preserves_order() -> None:
     assert [item["type"] for item in current.content_data] == ["text", "image"]
 
 
+def test_merge_deduplicates_same_at_target() -> None:
+    pending = Message(
+        content_text="@bot 第一段",
+        content_data=[
+            {"type": "at", "text": "@bot", "target_platform_userid": "bot", "target_nickname": "Bot"},
+            {"type": "text", "text": " 第一段"},
+        ],
+    )
+    current = Message(
+        content_text="@bot 第二段",
+        content_data=[
+            {"type": "at", "text": "@bot", "target_platform_userid": "bot", "target_nickname": "Bot"},
+            {"type": "text", "text": " 第二段"},
+        ],
+    )
+    merge_into_message(current, [pending])
+    assert current.content_text == "@bot 第一段 第二段"
+    assert sum(item["type"] == "at" for item in current.content_data) == 1
+
+
 def test_usage_scope_matches_chat_type() -> None:
     group = Message(chat_type="group")
     private = Message(chat_type="private")

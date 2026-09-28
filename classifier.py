@@ -82,11 +82,12 @@ class SentenceClassifier:
 class ClassifierAdapter:
     """管理模型目录、惰性依赖导入和线程池推理。"""
 
-    def __init__(self, model_type: str, data_dir: Path, logger: Any = None) -> None:
+    def __init__(self, model_type: str, data_dir: Path, logger: Any = None, debug_logging: bool = False) -> None:
         self.model_type = model_type if model_type in MODEL_REPOSITORIES else "small"
         self.data_dir = data_dir
         self.package_dir = data_dir / "packages"
         self.logger = logger
+        self.debug_logging = debug_logging
         self._classifier: Optional[SentenceClassifier] = None
         self._load_lock = asyncio.Lock()
 
@@ -139,6 +140,9 @@ class ClassifierAdapter:
     async def is_complete(self, text: str, threshold: float) -> bool:
         classifier = await self._ensure_loaded()
         score = await classifier.predict(text)
-        if self.logger is not None:
-            self.logger.debug(f"[Debounce] 完整概率: {score:.4f} | 阈值: {threshold:.4f}")
+        if self.logger is not None and self.debug_logging:
+            result = "complete" if score >= threshold else "incomplete"
+            self.logger.info(
+                f"[Debounce] 完整概率: {score:.4f} | 阈值: {threshold:.4f} | 判定: {result} | 模型: {self.model_type}",
+            )
         return score >= threshold

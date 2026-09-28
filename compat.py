@@ -100,21 +100,50 @@ def merge_text(parts: Sequence[str]) -> str:
     return " ".join(part.strip() for part in parts if part and part.strip())
 
 
+def _at_key(segment: Mapping[str, Any]) -> tuple[str, str] | None:
+    if str(segment.get("type", "")).lower() != "at":
+        return None
+    target = segment.get("target_platform_userid") or segment.get("target_nickname") or segment.get("text")
+    return "at", str(target)
+
+
+def merge_message_content(
+    parts: Sequence[tuple[str, Sequence[Any]]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """合并消息文本和消息段，并去除重复的同一目标 @。"""
+
+    seen_at: set[tuple[str, str]] = set()
+    text_parts: list[str] = []
+    segment_dicts: list[dict[str, Any]] = []
+    for text, content_data in parts:
+        current_segments = content_data_to_dicts(content_data)
+        current_text = str(text or "")
+        for segment in current_segments:
+            key = _at_key(segment)
+            if key is not None:
+                token = str(segment.get("text", "") or "")
+                if key in seen_at:
+                    if token:
+                        current_text = current_text.replace(token, "", 1)
+                    continue
+                seen_at.add(key)
+            segment_dicts.append(segment)
+        text_parts.append(current_text)
+    return merge_text(text_parts), segment_dicts
+
+
 def merge_into_message(message: Any, envelopes: Sequence[Any]) -> None:
     """将缓冲内容按顺序写回当前 ChatMessage。"""
 
-    current_text = str(getattr(message, "content_text", "") or "")
-    text_parts = [
-        str(getattr(item, "text", getattr(item, "content_text", "")) or "")
+    parts = [
+        (
+            str(getattr(item, "text", getattr(item, "content_text", "")) or ""),
+            getattr(item, "content_data", []),
+        )
         for item in envelopes
     ]
-    text_parts.append(current_text)
-    merged_text = merge_text(text_parts)
-
-    segment_dicts: list[dict[str, Any]] = []
-    for item in envelopes:
-        segment_dicts.extend(content_data_to_dicts(getattr(item, "content_data", [])))
-    segment_dicts.extend(content_data_to_dicts(getattr(message, "content_data", [])))
+    parts.append((str(getattr(message, "content_text", "") or ""), getattr(message, "content_data", [])))
+    merged_text, segment_dicts = merge_message_content(parts)
     merged_segments = restore_segments(segment_dicts)
     message.content_text = merged_text
     message.content_data = merged_segments

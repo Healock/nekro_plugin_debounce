@@ -15,12 +15,16 @@
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
+| `debounce_mode` | `semantic` | `semantic` 使用完整性模型；`time` 按 `timeout_seconds` 固定等待。 |
 | `model_type` | `small` | `small` 或 `normal` |
-| `send_threshold` | `0.8` | 完整概率阈值 |
+| `send_threshold` | `0.8` | 完整概率阈值；值越高，越不容易判定为已说完。建议从 `0.9` 或 `0.95` 开始测试。 |
 | `timeout_seconds` | `10` | 超时自动发送，`0` 表示不超时 |
 | `enabled` | `true` | 是否启用 |
 | `usage_scope` | `both` | `both`、`group`、`private` |
 | `cancel_on_new_message` | `true` | 字段保留；Nekro v0.1.1 不取消运行中的 Agent |
+| `debug_logging` | `false` | 开启后在日志中记录完整概率、阈值、判定结果和模型类型 |
+
+语义模式下，完整性概率达到 `send_threshold` 才会直接触发；如果希望更严格地等待后续消息，应提高该值。时间模式不会加载或调用 ONNX 完整性模型，而是在每条消息后重新等待 `timeout_seconds` 秒，适合复刻原生时间防抖。
 
 现有 Nekro 配置不会自动导入 AstrBot 配置文件。`_conf_schema.json` 的 `0.8/10` 是迁移默认值；AstrBot README 与源码中的 `0.5/30` fallback 不作为新配置默认值。
 
@@ -39,7 +43,7 @@ Nekro 公共 API 没有当前用户消息的 after-persist 回调，因此完整
 
 ## 模型与依赖
 
-ONNX Runtime、Transformers、NumPy 和 ModelScope 仅在首次需要分类时惰性导入，使用 Nekro 的 `dynamic_import_pkg` 管理。导入插件时不会联网、安装依赖或加载模型。模型目录为：
+ONNX Runtime、Transformers、NumPy 和 ModelScope 仅在首次需要语义分类时惰性导入，使用 Nekro 的 `dynamic_import_pkg` 管理。导入插件时不会联网、安装依赖或加载模型。`model_type` 会选择预设的 ModelScope 仓库，模型和依赖会在首次语义分类时自动下载；也可以提前放置模型文件。模型目录为：
 
 ```text
 <plugin data dir>/models/<model_type>/model.onnx
