@@ -21,7 +21,7 @@
 | `max_wait_seconds` | `60` | 从第一条消息开始计算的最大等待时间，单位为秒 |
 | `enabled` | `true` | 是否启用 |
 | `usage_scope` | `both` | `both`、`group`、`private` |
-| `cancel_on_new_message` | `true` | 字段保留；Nekro v0.2.0 不取消运行中的 Agent |
+| `cancel_on_new_message` | `true` | 字段保留；Nekro v0.3.0 不取消运行中的 Agent |
 | `debug_logging` | `false` | 开启后在日志中记录完整概率、阈值、判定结果和模型类型 |
 
 每条文本消息都会基于当前频道的累计文本重新分类，但语义完整不会立即触发，仍需等待 `timeout_seconds` 秒的静默窗口。静默结束时如果仍不完整，则继续等待下一次静默窗口，直到 `max_wait_seconds` 到达后强制触发。模型加载或推理失败时，当前批次退化为纯时间防抖，在静默窗口结束后触发。
@@ -60,4 +60,4 @@ Nekro v0.3.0 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息�
 
 ## 验证边界
 
-本仓库包含混合状态机、分类器数学适配、journal 序列化/恢复/幂等、timeout 和媒体边界测试。当前本地验证结果为：`python -m compileall -q .` 通过，`python -m pytest -q` 为 18 passed，`git diff --check` 通过。未运行 Docker、真实 Nekro、OneBot、ONNX 推理或模型下载，因此不能据此声称插件已在真实部署中加载或运行通过。
+本仓库包含混合状态机、分类器数学适配、journal 序列化/恢复/幂等、timeout 和媒体边界测试。当前本地验证结果为：`python -m compileall -q .` 通过，`python -m pytest -q` 为 19 passed，`git diff --check` 通过。未运行 Docker、真实 Nekro、OneBot、ONNX 推理或模型下载，因此不能据此声称插件已在真实部署中加载或运行通过。
