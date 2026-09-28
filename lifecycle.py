@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -47,6 +48,7 @@ class DebounceRuntime:
         self.tasks = TaskManager(self._on_timeout, logger=plugin.logger)
         self._started = False
         self._stopping = False
+        self._preload_task: asyncio.Task[None] | None = None
         self._timeout_state_failures: dict[tuple[str, int], int] = {}
 
     @property
@@ -67,6 +69,7 @@ class DebounceRuntime:
         if self._started:
             return
         self._stopping = False
+        self._preload_task = asyncio.create_task(self._preload_classifier(), name="debounce-classifier-preload")
         try:
             records = await self.journal.load()
         except JournalError as exc:
@@ -139,10 +142,65 @@ class DebounceRuntime:
                 self.logger.exception(f"[Debounce] 恢复 timeout 任务失败: {chat_key}: {exc}")
         self._started = True
 
+    async def _preload_classifier(self) -> None:
+        started_at = time.monotonic()
+        self.logger.info("[Debounce] 插件初始化阶段开始预加载语义分类器")
+        try:
+            await self.classifier.preload()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                f"[Debounce] 语义分类器预加载失败，后续批次使用时间防抖: {exc} "
+                f"elapsed={time.monotonic() - started_at:.1f}s",
+            )
+            return
+        self.logger.info(f"[Debounce] 语义分类器预加载完成 elapsed={time.monotonic() - started_at:.1f}s")
+
     async def stop(self) -> None:
         self._stopping = True
+        if self._preload_task is not None and not self._preload_task.done():
+            self._preload_task.cancel()
+            await asyncio.gather(self._preload_task, return_exceptions=True)
+        self._preload_task = None
         await self.tasks.cancel_all()
         self._started = False
+
+    async def reset_channel(self, ctx: Any) -> None:
+        chat_key = str(getattr(ctx, "chat_key", "") or "")
+        if not chat_key:
+            return
+        async with self.buffers.lock_for(chat_key):
+            buffer = self.buffers.get(chat_key)
+            if buffer is None or not buffer.messages:
+                return
+            count = len(buffer.messages)
+            record_ids = buffer.record_ids
+            try:
+                cleaned = await self.journal.discard(record_ids)
+                if not cleaned:
+                    self.logger.warning(
+                        f"[Debounce] reset 已持久化 ACK，但 journal 物理清理失败: chat={chat_key} "
+                        f"generation={buffer.generation}",
+                    )
+            except JournalError as exc:
+                self.logger.exception(
+                    f"[Debounce] reset 批次 ACK 失败，尝试标记人工恢复: chat={chat_key} "
+                    f"generation={buffer.generation}: {exc}",
+                )
+                try:
+                    await self.journal.mark_manual_recovery(record_ids, "channel_reset")
+                except JournalError as recovery_exc:
+                    self.logger.critical(
+                        f"[Debounce] reset journal 无法持久化取消状态，需人工检查: chat={chat_key} "
+                        f"generation={buffer.generation}: {recovery_exc}",
+                    )
+            self.tasks.cancel(chat_key, buffer.generation)
+            self.buffers.clear(chat_key, buffer.generation)
+            self.logger.info(
+                f"[Debounce] reset 已取消 pending 批次: chat={chat_key} "
+                f"generation={buffer.generation} messages={count}",
+            )
 
     async def handle_user_message(self, _ctx: Any, message: Any) -> MsgSignal:
         if self._stopping or not self.config.enabled or not usage_scope_matches(message, self.config.usage_scope):
@@ -168,6 +226,24 @@ class DebounceRuntime:
             buffer = await self._buffer_message(message, current_buffer)
             if buffer is None:
                 return MsgSignal.CONTINUE
+            preload_pending = self._preload_task is not None and not self._preload_task.done()
+            preload_failed = self.classifier.load_error is not None
+            if not self.classifier.is_ready and (preload_pending or preload_failed):
+                buffer.classifier_fallback = True
+                try:
+                    await self.journal.update_batch(buffer.record_ids, classifier_fallback=True)
+                except JournalError as exc:
+                    self.logger.exception(f"[Debounce] 保存预加载降级状态失败: {exc}")
+                    try:
+                        await self.journal.mark_manual_recovery(buffer.record_ids, "preload_state_persist_failed")
+                    except JournalError:
+                        pass
+                    self.buffers.clear(chat_key, buffer.generation)
+                    self.tasks.cancel(chat_key, buffer.generation)
+                    return MsgSignal.CONTINUE
+                if not await self._apply_wait_policy(buffer):
+                    return MsgSignal.CONTINUE
+                return MsgSignal.BLOCK_ALL
             if buffer.classifier_fallback:
                 return MsgSignal.BLOCK_ALL
 
@@ -608,3 +684,7 @@ def register_lifecycle(plugin: Any, runtime: DebounceRuntime) -> None:
     @plugin.mount_cleanup_method()
     async def _cleanup() -> None:
         await runtime.stop()
+
+    @plugin.mount_on_channel_reset()
+    async def _on_channel_reset(ctx: Any) -> None:
+        await runtime.reset_channel(ctx)

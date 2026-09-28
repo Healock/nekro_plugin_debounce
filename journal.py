@@ -165,15 +165,54 @@ class JournalStore:
         await self._ensure_loaded()
         ids = list(event_ids)
         async with self._lock:
+            previous: dict[str, JournalRecord] = {
+                event_id: record.model_copy(deep=True)
+                for event_id in ids
+                if (record := self._records.get(event_id)) is not None
+            }
             for event_id in ids:
                 record = self._records.get(event_id)
                 if record is not None:
                     record.state = JournalState.ACKED
                     record.updated_at = time.time()
-            await self._save_locked()
+            try:
+                await self._save_locked()
+            except Exception:
+                self._records.update(previous)
+                raise
             for event_id in ids:
                 self._records.pop(event_id, None)
             await self._save_locked()
+
+    async def discard(self, event_ids: Iterable[str]) -> bool:
+        """先持久化 ACK，再尽力清除记录；ACK tombstone 不会在启动时恢复。"""
+
+        await self._ensure_loaded()
+        ids = list(event_ids)
+        async with self._lock:
+            previous = {
+                event_id: record.model_copy(deep=True)
+                for event_id in ids
+                if (record := self._records.get(event_id)) is not None
+            }
+            for event_id in ids:
+                record = self._records.get(event_id)
+                if record is not None:
+                    record.state = JournalState.ACKED
+                    record.updated_at = time.time()
+            try:
+                await self._save_locked()
+            except Exception:
+                self._records.update(previous)
+                raise
+
+            for event_id in ids:
+                self._records.pop(event_id, None)
+            try:
+                await self._save_locked()
+            except JournalError:
+                return False
+            return True
 
     async def records(self) -> list[JournalRecord]:
         await self._ensure_loaded()

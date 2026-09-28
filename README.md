@@ -1,6 +1,6 @@
 # NekroAgent 消息防抖
 
-版本：`0.4.0`
+版本：`0.4.1`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
@@ -51,18 +51,20 @@ Nekro 公共 API 没有当前用户消息的 after-persist 回调，因此完整
 
 ## 模型与依赖
 
-ONNX Runtime、Transformers、NumPy 和 ModelScope 仅在首次需要语义分类时惰性导入，使用 Nekro 的 `dynamic_import_pkg` 管理。导入插件时不会联网、安装依赖或加载模型。`model_type` 会选择预设的 ModelScope 仓库，模型和依赖会在首次语义分类时自动下载；也可以提前放置模型文件。模型目录为：
+ONNX Runtime、Transformers、NumPy 和 ModelScope 在插件初始化阶段开始惰性导入，使用 Nekro 的 `dynamic_import_pkg` 管理；插件模块导入阶段不会联网、安装依赖或加载模型。预加载在后台执行，不阻塞 Nekro 启动。预加载完成前收到的消息使用时间防抖，不会在消息回调中等待首次依赖安装或模型下载。`model_type` 会选择预设的 ModelScope 仓库；也可以提前放置模型文件。模型目录为：
 
 ```text
 <plugin data dir>/models/<model_type>/model.onnx
 <plugin data dir>/models/<model_type>/tokenizer/
 ```
 
-模型缺失时首次使用会尝试从 ModelScope 下载到插件专属缓存；部署也可以提前放置模型文件。
+模型缺失时插件初始化会尝试从 ModelScope 下载到插件专属缓存。依赖安装或下载可能在首次启动时消耗较多网络和磁盘资源。预加载失败时插件保持可用并退化为时间防抖。本地静态测试不能证明真实服务器的模型下载或 ONNX 推理成功。
+
+频道执行 `/reset` 时，插件会取消该频道尚未释放的防抖批次，避免重置后旧消息延迟触发。
 
 ## Nekro API 差异
 
-Nekro v0.4.0 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息伪造、运行中 Agent 取消、旧回复丢弃和媒体消息重放。超时重放仅用于恢复本插件自己阻塞的文本批次；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。
+Nekro v0.4.1 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息伪造、运行中 Agent 取消、旧回复丢弃和媒体消息重放。超时重放仅用于恢复本插件自己阻塞的文本批次；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。
 
 ## 验证边界
 
