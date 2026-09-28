@@ -100,17 +100,50 @@ class ClassifierAdapter:
         self.debug_logging = debug_logging
         self._classifier: Optional[SentenceClassifier] = None
         self._load_lock = asyncio.Lock()
+        self._load_error: ClassifierUnavailable | None = None
 
     @property
     def model_dir(self) -> Path:
         return self.data_dir / "models" / self.model_type
+
+    @property
+    def is_ready(self) -> bool:
+        return self._classifier is not None
+
+    @property
+    def load_error(self) -> ClassifierUnavailable | None:
+        return self._load_error
+
+    async def preload(self) -> None:
+        """在插件初始化阶段加载依赖、模型和推理会话。"""
+
+        if self._classifier is not None:
+            return
+        try:
+            await self._ensure_loaded()
+        except Exception as exc:
+            if isinstance(exc, ClassifierUnavailable):
+                self._load_error = exc
+                raise
+            error = ClassifierUnavailable(str(exc))
+            self._load_error = error
+            raise error from exc
 
     async def _ensure_loaded(self) -> SentenceClassifier:
         if self._classifier is not None:
             return self._classifier
         async with self._load_lock:
             if self._classifier is None:
-                self._classifier = await asyncio.to_thread(self._load_sync)
+                try:
+                    self._classifier = await asyncio.to_thread(self._load_sync)
+                    self._load_error = None
+                except Exception as exc:
+                    if isinstance(exc, ClassifierUnavailable):
+                        self._load_error = exc
+                        raise
+                    error = ClassifierUnavailable(str(exc))
+                    self._load_error = error
+                    raise error from exc
         return self._classifier
 
     def _load_sync(self) -> SentenceClassifier:

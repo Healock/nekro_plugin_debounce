@@ -59,3 +59,26 @@ async def test_journal_restores_pending_state() -> None:
     second = JournalStore(backing)
     records = await second.load()
     assert records[0].state == JournalState.PENDING
+
+
+@pytest.mark.asyncio
+async def test_discard_leaves_safe_ack_tombstone_when_cleanup_save_fails() -> None:
+    class CleanupFailStore(Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def set(self, **kwargs):
+            self.calls += 1
+            if self.calls == 3:
+                raise OSError("temporary cleanup failure")
+            self.value = kwargs["value"]
+            return 1
+
+    backing = CleanupFailStore()
+    journal = JournalStore(backing)
+    await journal.append(make_record())
+
+    assert not await journal.discard(["m1"])
+    assert await journal.records() == []
+    assert await JournalStore(backing).load() == []
