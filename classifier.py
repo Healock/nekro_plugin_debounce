@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,6 +18,12 @@ MODEL_REPOSITORIES = {
 
 class ClassifierUnavailable(RuntimeError):
     """模型或依赖不可用。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationResult:
+    probability: float
+    complete: bool
 
 
 def send_probability(logits: Any) -> float:
@@ -138,11 +145,9 @@ class ClassifierAdapter:
             raise ClassifierUnavailable(f"模型不存在且下载失败: {exc}") from exc
 
     async def is_complete(self, text: str, threshold: float) -> bool:
+        return (await self.classify(text, threshold)).complete
+
+    async def classify(self, text: str, threshold: float) -> ClassificationResult:
         classifier = await self._ensure_loaded()
         score = await classifier.predict(text)
-        if self.logger is not None and self.debug_logging:
-            result = "complete" if score >= threshold else "incomplete"
-            self.logger.info(
-                f"[Debounce] 完整概率: {score:.4f} | 阈值: {threshold:.4f} | 判定: {result} | 模型: {self.model_type}",
-            )
-        return score >= threshold
+        return ClassificationResult(probability=score, complete=score >= threshold)

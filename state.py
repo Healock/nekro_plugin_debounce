@@ -39,6 +39,14 @@ class JournalRecord(BaseModel):
     raw_cq_code: str = ""
     updated_at: float
     timeout_at: float
+    first_seen_at: float = 0.0
+    quiet_deadline: float = 0.0
+    max_wait_deadline: float = 0.0
+    semantic_complete: bool | None = None
+    semantic_probability: float | None = None
+    semantic_checked_at: float = 0.0
+    classifier_fallback: bool = False
+    release_reason: str = ""
     retries: int = 0
     error_state: str = ""
 
@@ -80,6 +88,13 @@ class ChatBuffer:
     messages: list[MessageEnvelope] = field(default_factory=list)
     last_update: float = 0.0
     timeout_at: float = 0.0
+    first_seen_at: float = 0.0
+    quiet_deadline: float = 0.0
+    max_wait_deadline: float = 0.0
+    semantic_complete: bool | None = None
+    semantic_probability: float | None = None
+    semantic_checked_at: float = 0.0
+    classifier_fallback: bool = False
 
     @property
     def record_ids(self) -> list[str]:

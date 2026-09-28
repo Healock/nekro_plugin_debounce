@@ -116,6 +116,44 @@ class JournalStore:
     async def mark_flushing(self, event_ids: Iterable[str]) -> None:
         await self.transition(event_ids, JournalState.FLUSHING)
 
+    async def update_batch(self, event_ids: Iterable[str], **updates: object) -> None:
+        """原子更新同一缓冲批次的截止时间和语义状态。"""
+
+        allowed = {
+            "timeout_at",
+            "first_seen_at",
+            "quiet_deadline",
+            "max_wait_deadline",
+            "semantic_complete",
+            "semantic_probability",
+            "semantic_checked_at",
+            "classifier_fallback",
+            "release_reason",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"不支持的 journal 批次字段: {sorted(unknown)}")
+        await self._ensure_loaded()
+        ids = list(event_ids)
+        async with self._lock:
+            previous = {
+                event_id: record.model_copy(deep=True)
+                for event_id in ids
+                if (record := self._records.get(event_id)) is not None
+            }
+            for event_id in ids:
+                record = self._records.get(event_id)
+                if record is None:
+                    continue
+                for key, value in updates.items():
+                    setattr(record, key, value)
+                record.updated_at = time.time()
+            try:
+                await self._save_locked()
+            except Exception:
+                self._records.update(previous)
+                raise
+
     async def acknowledge(self, event_ids: Iterable[str]) -> None:
         """先持久化 ACK，再清理记录，避免清理失败造成丢失。"""
 
