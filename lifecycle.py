@@ -489,14 +489,15 @@ class DebounceRuntime:
                 reason = "classifier_unavailable_time_fallback"
             else:
                 result = await self._classify_buffer(buffer)
-                if result is None:
+                finished_at = time.time()
+                if finished_at >= buffer.max_wait_deadline:
+                    reason = "max_wait_fallback"
+                elif result is None:
                     reason = "classifier_unavailable_time_fallback"
                 elif result.complete:
                     reason = "quiet_and_complete"
-                elif now >= buffer.max_wait_deadline:
-                    reason = "max_wait_fallback"
                 else:
-                    next_deadline = min(now + self.quiet_seconds, buffer.max_wait_deadline)
+                    next_deadline = min(finished_at + self.quiet_seconds, buffer.max_wait_deadline)
                     buffer.quiet_deadline = next_deadline
                     buffer.timeout_at = next_deadline
                     buffer.selected_wait_seconds = self.quiet_seconds

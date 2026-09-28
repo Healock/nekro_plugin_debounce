@@ -262,6 +262,33 @@ async def test_incomplete_timeout_waits_then_max_wait_forces_release() -> None:
 
 
 @pytest.mark.asyncio
+async def test_max_wait_takes_precedence_over_complete_result() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(
+        plugin,
+        DebounceConfig(timeout_seconds=1, high_confidence_timeout_seconds=1, max_wait_seconds=5),
+    )
+    runtime.classifier.classify = lambda *_args: _result(True)  # type: ignore[method-assign]
+    reasons: list[str] = []
+
+    async def capture_reason(buffer, reason):
+        reasons.append(reason)
+
+    runtime._flush_after_timeout = capture_reason  # type: ignore[method-assign]
+    message = Message(message_id="max-complete", content_text="已完成", content_data=[{"type": "text", "text": "已完成"}])
+    await runtime.handle_user_message(None, message)
+    buffer = runtime.buffers.get("chat")
+    assert buffer is not None
+    buffer.quiet_deadline = time.time() - 1
+    buffer.max_wait_deadline = time.time() - 1
+    await runtime._on_timeout("chat", buffer.generation)
+    assert reasons == ["max_wait_fallback"]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_classifier_failure_falls_back_to_quiet_window() -> None:
     from nekro_plugin_debounce import plugin
 
