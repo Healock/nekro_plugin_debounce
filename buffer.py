@@ -35,7 +35,14 @@ class BufferManager:
             return generation, 0
         return buffer.generation, len(buffer.messages)
 
-    def add(self, envelope: MessageEnvelope, timeout_at: float) -> ChatBuffer:
+    def add(
+        self,
+        envelope: MessageEnvelope,
+        timeout_at: float,
+        *,
+        first_seen_at: float,
+        max_wait_deadline: float,
+    ) -> ChatBuffer:
         buffer = self._buffers.get(envelope.chat_key)
         if buffer is None:
             buffer = ChatBuffer(
@@ -43,6 +50,9 @@ class BufferManager:
                 generation=envelope.generation,
                 last_update=0.0,
                 timeout_at=timeout_at,
+                first_seen_at=first_seen_at,
+                quiet_deadline=timeout_at,
+                max_wait_deadline=max_wait_deadline,
             )
             self._buffers[envelope.chat_key] = buffer
         if buffer.generation != envelope.generation:
@@ -50,6 +60,8 @@ class BufferManager:
         buffer.messages.append(envelope)
         buffer.last_update = time.time()
         buffer.timeout_at = timeout_at
+        buffer.quiet_deadline = timeout_at
+        buffer.max_wait_deadline = max_wait_deadline
         self._generation_seed[envelope.chat_key] = max(
             self._generation_seed.get(envelope.chat_key, -1),
             envelope.generation,
@@ -67,7 +79,18 @@ class BufferManager:
     def clear(self, chat_key: str, generation: int) -> Optional[ChatBuffer]:
         return self.take(chat_key, generation)
 
-    def restore(self, envelopes: Iterable[MessageEnvelope], timeout_at: float) -> None:
+    def restore(
+        self,
+        envelopes: Iterable[MessageEnvelope],
+        timeout_at: float,
+        *,
+        first_seen_at: float,
+        max_wait_deadline: float,
+        semantic_complete: bool | None = None,
+        semantic_probability: float | None = None,
+        semantic_checked_at: float = 0.0,
+        classifier_fallback: bool = False,
+    ) -> None:
         grouped: dict[tuple[str, int], list[MessageEnvelope]] = {}
         for envelope in envelopes:
             grouped.setdefault((envelope.chat_key, envelope.generation), []).append(envelope)
@@ -83,6 +106,13 @@ class BufferManager:
                 messages=items,
                 last_update=0.0,
                 timeout_at=timeout_at,
+                first_seen_at=first_seen_at,
+                quiet_deadline=timeout_at,
+                max_wait_deadline=max_wait_deadline,
+                semantic_complete=semantic_complete,
+                semantic_probability=semantic_probability,
+                semantic_checked_at=semantic_checked_at,
+                classifier_fallback=classifier_fallback,
             )
             self._buffers[chat_key] = buffer
 

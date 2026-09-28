@@ -1,4 +1,4 @@
-"""防抖插件生命周期和主状态机。"""
+"""防抖插件生命周期和混合状态机。"""
 
 from __future__ import annotations
 
@@ -8,17 +8,16 @@ from typing import Any
 from nekro_agent.schemas.signal import MsgSignal
 
 from .buffer import BufferManager
-from .classifier import ClassifierAdapter
+from .classifier import ClassificationResult, ClassifierAdapter
 from .compat import (
+    REPLAY_MARKER,
     content_data_to_dicts,
     has_hard_boundary,
     is_replay_message,
     merge_into_message,
     merge_message_content,
-    merge_text,
     message_event_id,
     message_id,
-    REPLAY_MARKER,
     restore_segments,
     sender_id,
     sender_name,
@@ -54,6 +53,10 @@ class DebounceRuntime:
     def logger(self) -> Any:
         return self.plugin.logger
 
+    @property
+    def quiet_seconds(self) -> float:
+        return max(0.0, float(self.config.timeout_seconds))
+
     async def start(self) -> None:
         if self._started:
             return
@@ -79,9 +82,12 @@ class DebounceRuntime:
             except JournalError as exc:
                 self.logger.exception(f"[Debounce] 标记人工恢复失败: {exc}")
 
-        grouped: dict[tuple[str, int], list[MessageEnvelope]] = {}
+        grouped: dict[tuple[str, int], list[JournalRecord]] = {}
         for record in pending:
-            grouped.setdefault((record.chat_key, record.generation), []).append(
+            grouped.setdefault((record.chat_key, record.generation), []).append(record)
+        for (chat_key, generation), batch in grouped.items():
+            batch.sort(key=lambda item: item.sequence)
+            envelopes = [
                 MessageEnvelope(
                     event_id=record.event_id,
                     message_id=record.last_message_id,
@@ -96,20 +102,30 @@ class DebounceRuntime:
                     adapter_key=record.adapter_key,
                     platform_userid=record.platform_userid,
                     raw_cq_code=record.raw_cq_code,
-                ),
+                )
+                for record in batch
+            ]
+            first_seen_at = min(record.first_seen_at or record.updated_at for record in batch)
+            max_wait_deadline = max(record.max_wait_deadline for record in batch)
+            if max_wait_deadline <= 0:
+                max_wait_deadline = first_seen_at + float(self.config.max_wait_seconds)
+            quiet_deadline = max(record.quiet_deadline or record.timeout_at for record in batch)
+            quiet_deadline = min(quiet_deadline or max_wait_deadline, max_wait_deadline)
+            latest = batch[-1]
+            self.buffers.restore(
+                envelopes,
+                quiet_deadline,
+                first_seen_at=first_seen_at,
+                max_wait_deadline=max_wait_deadline,
+                semantic_complete=latest.semantic_complete,
+                semantic_probability=latest.semantic_probability,
+                semantic_checked_at=latest.semantic_checked_at,
+                classifier_fallback=any(record.classifier_fallback for record in batch),
             )
-        pending_by_key = {
-            key: [record for record in pending if (record.chat_key, record.generation) == key]
-            for key in grouped
-        }
-        for (chat_key, generation), envelopes in grouped.items():
-            timeout_at = max(record.timeout_at for record in pending_by_key[(chat_key, generation)])
-            self.buffers.restore(envelopes, timeout_at)
-            if self.config.timeout_seconds > 0:
-                try:
-                    self.tasks.schedule(chat_key, generation, timeout_at)
-                except Exception as exc:
-                    self.logger.exception(f"[Debounce] 恢复 timeout 任务失败: {chat_key}: {exc}")
+            try:
+                self.tasks.schedule(chat_key, generation, quiet_deadline)
+            except Exception as exc:
+                self.logger.exception(f"[Debounce] 恢复 timeout 任务失败: {chat_key}: {exc}")
         self._started = True
 
     async def stop(self) -> None:
@@ -138,40 +154,44 @@ class DebounceRuntime:
             if not current_text.strip() and not getattr(message, "content_data", None):
                 return MsgSignal.CONTINUE
 
-            # AstrBot 在已有 pending 时会直接合并下一条文本，避免再次分类导致持续阻塞。
-            if current_buffer is not None and current_buffer.messages:
-                if self.config.debounce_mode == "time":
-                    return await self._buffer_message(message)
-                return await self._merge_and_trigger(message, current_buffer, "pending_text")
+            buffer = await self._buffer_message(message, current_buffer)
+            if buffer is None:
+                return MsgSignal.CONTINUE
+            if buffer.classifier_fallback:
+                return MsgSignal.BLOCK_ALL
 
-            if self.config.debounce_mode == "time":
-                return await self._buffer_message(message)
+            result = await self._classify_buffer(buffer)
+            if self.config.debug_logging:
+                status = "classifier_unavailable_time_fallback"
+                if result is not None:
+                    status = "semantic_complete_waiting_quiet" if result.complete else "semantic_incomplete_wait"
+                self.logger.info(f"[Debounce] status={status} text_length={len(buffer.text)}")
+            return MsgSignal.BLOCK_ALL
 
-            candidate = merge_text(
-                [current_text],
-            )
-            try:
-                complete = await self.classifier.is_complete(candidate, float(self.config.send_threshold))
-            except Exception as exc:
-                self.logger.warning(f"[Debounce] 分类器不可用，当前消息 fail-open: {exc}")
-                if current_buffer is None or not current_buffer.messages:
-                    return MsgSignal.CONTINUE
-                return await self._merge_and_trigger(message, current_buffer, "classifier_failure")
-
-            if complete:
-                if current_buffer is None or not current_buffer.messages:
-                    return MsgSignal.FORCE_TRIGGER
-                return await self._merge_and_trigger(message, current_buffer, "complete")
-
-            return await self._buffer_message(message)
-
-    async def _buffer_message(self, message: Any) -> MsgSignal:
-        """持久化一条待处理消息并从最后一条消息重新计算超时。"""
+    async def _buffer_message(self, message: Any, current_buffer: ChatBuffer | None) -> ChatBuffer | None:
+        """持久化一条消息，重置静默窗口但不延长最大等待时间。"""
 
         chat_key = str(getattr(message, "chat_key", "") or "")
-        generation, sequence = self.buffers.next_position(chat_key)
+        now = time.time()
+        if current_buffer is None or not current_buffer.messages:
+            generation, sequence = self.buffers.next_position(chat_key)
+            first_seen_at = now
+            max_wait_deadline = now + float(self.config.max_wait_seconds)
+            classifier_fallback = False
+            semantic_complete = None
+            semantic_probability = None
+            semantic_checked_at = 0.0
+        else:
+            generation = current_buffer.generation
+            sequence = len(current_buffer.messages)
+            first_seen_at = current_buffer.first_seen_at or now
+            max_wait_deadline = current_buffer.max_wait_deadline or first_seen_at + float(self.config.max_wait_seconds)
+            classifier_fallback = current_buffer.classifier_fallback
+            semantic_complete = current_buffer.semantic_complete
+            semantic_probability = current_buffer.semantic_probability
+            semantic_checked_at = current_buffer.semantic_checked_at
+        quiet_deadline = min(now + self.quiet_seconds, max_wait_deadline)
         event_id = message_event_id(message)
-        timeout_at = time.time() + max(0, int(self.config.timeout_seconds))
         record = JournalRecord(
             event_id=event_id,
             chat_key=chat_key,
@@ -186,14 +206,21 @@ class DebounceRuntime:
             adapter_key=str(getattr(message, "adapter_key", "") or ""),
             platform_userid=str(getattr(message, "platform_userid", "") or ""),
             raw_cq_code=str(getattr(message, "raw_cq_code", "") or ""),
-            updated_at=time.time(),
-            timeout_at=timeout_at,
+            updated_at=now,
+            timeout_at=quiet_deadline,
+            first_seen_at=first_seen_at,
+            quiet_deadline=quiet_deadline,
+            max_wait_deadline=max_wait_deadline,
+            semantic_complete=semantic_complete,
+            semantic_probability=semantic_probability,
+            semantic_checked_at=semantic_checked_at,
+            classifier_fallback=classifier_fallback,
         )
         try:
             await self.journal.append(record)
         except JournalError as exc:
             self.logger.exception(f"[Debounce] BLOCK_ALL 前 journal 写入失败，当前消息放行: {exc}")
-            return MsgSignal.CONTINUE
+            return None
 
         envelope = MessageEnvelope(
             event_id=event_id,
@@ -210,22 +237,105 @@ class DebounceRuntime:
             platform_userid=record.platform_userid,
             raw_cq_code=record.raw_cq_code,
         )
-        self.buffers.add(envelope, timeout_at)
-        if self.config.timeout_seconds > 0:
+        try:
+            buffer = self.buffers.add(
+                envelope,
+                quiet_deadline,
+                first_seen_at=first_seen_at,
+                max_wait_deadline=max_wait_deadline,
+            )
+        except Exception as exc:
+            self.logger.exception(f"[Debounce] 消息加入内存缓冲失败，当前消息放行: {exc}")
             try:
-                self.tasks.schedule(chat_key, generation, timeout_at)
-            except Exception as exc:
-                self.logger.exception(f"[Debounce] timeout 创建失败，保留 journal 等待恢复: {exc}")
-                try:
-                    await self.journal.transition(
-                        [event_id],
-                        JournalState.PENDING,
-                        error_state="timeout_task_creation_failed",
-                        increment_retries=True,
-                    )
-                except JournalError as journal_exc:
-                    self.logger.exception(f"[Debounce] timeout 失败状态写入失败: {journal_exc}")
-        return MsgSignal.BLOCK_ALL
+                await self.journal.mark_manual_recovery(
+                    [event_id] if current_buffer is None else current_buffer.record_ids + [event_id],
+                    "buffer_append_failed",
+                )
+            except JournalError:
+                pass
+            self.buffers.clear(chat_key, generation)
+            self.tasks.cancel(chat_key, generation)
+            return None
+        buffer.classifier_fallback = classifier_fallback
+        buffer.semantic_complete = semantic_complete
+        buffer.semantic_probability = semantic_probability
+        buffer.semantic_checked_at = semantic_checked_at
+        try:
+            await self.journal.update_batch(
+                buffer.record_ids,
+                first_seen_at=first_seen_at,
+                quiet_deadline=quiet_deadline,
+                timeout_at=quiet_deadline,
+                max_wait_deadline=max_wait_deadline,
+                classifier_fallback=classifier_fallback,
+            )
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] 保存批次截止时间失败，当前消息放行: {exc}")
+            try:
+                await self.journal.mark_manual_recovery(buffer.record_ids, "batch_deadline_persist_failed")
+            except JournalError:
+                pass
+            self.buffers.clear(chat_key, generation)
+            self.tasks.cancel(chat_key, generation)
+            return None
+        try:
+            self.tasks.schedule(chat_key, generation, quiet_deadline)
+        except Exception as exc:
+            self.logger.exception(f"[Debounce] timeout 创建失败，保留 journal 等待恢复: {exc}")
+            try:
+                await self.journal.transition(
+                    [event_id],
+                    JournalState.PENDING,
+                    error_state="timeout_task_creation_failed",
+                    increment_retries=True,
+                )
+            except JournalError as journal_exc:
+                self.logger.exception(f"[Debounce] timeout 失败状态写入失败: {journal_exc}")
+        return buffer
+
+    async def _classify_buffer(self, buffer: ChatBuffer) -> ClassificationResult | None:
+        try:
+            result = await self.classifier.classify(buffer.text, float(self.config.send_threshold))
+        except Exception as exc:
+            buffer.classifier_fallback = True
+            self.logger.warning(f"[Debounce] 当前批次退化为时间防抖: {exc}")
+            try:
+                await self.journal.update_batch(
+                    buffer.record_ids,
+                    classifier_fallback=True,
+                    semantic_complete=None,
+                    semantic_probability=None,
+                    semantic_checked_at=time.time(),
+                )
+            except JournalError as journal_exc:
+                self.logger.exception(f"[Debounce] 保存分类器降级状态失败: {journal_exc}")
+            return None
+
+        checked_at = time.time()
+        buffer.semantic_complete = result.complete
+        buffer.semantic_probability = result.probability
+        buffer.semantic_checked_at = checked_at
+        try:
+            await self.journal.update_batch(
+                buffer.record_ids,
+                semantic_complete=result.complete,
+                semantic_probability=result.probability,
+                semantic_checked_at=checked_at,
+                classifier_fallback=False,
+            )
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] 保存语义判定状态失败: {exc}")
+        if self.config.debug_logging:
+            self.logger.info(
+                f"[Debounce] chat={self._debug_chat_key(buffer.chat_key)} "
+                f"text_length={len(buffer.text)} probability={result.probability:.4f} "
+                f"threshold={float(self.config.send_threshold):.4f} "
+                f"complete={result.complete} elapsed={max(0.0, checked_at - buffer.first_seen_at):.1f}s",
+            )
+        return result
+
+    def _debug_chat_key(self, chat_key: str) -> str:
+        return f"{chat_key[:4]}...{chat_key[-4:]}" if len(chat_key) > 8 else chat_key
 
     async def _merge_and_trigger(self, message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
         try:
@@ -239,13 +349,18 @@ class DebounceRuntime:
             except JournalError as journal_exc:
                 self.logger.exception(f"[Debounce] 合并失败批次无法标记人工恢复: {journal_exc}")
             return MsgSignal.CONTINUE
+        try:
+            await self.journal.update_batch(buffer.record_ids, release_reason=reason)
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] 保存释放原因失败: {exc}")
         self.buffers.clear(buffer.chat_key, buffer.generation)
         self.tasks.cancel(buffer.chat_key, buffer.generation)
         try:
-            # 当前回调没有 after-persist API，保守标记人工恢复，禁止启动时自动重复触发。
             await self.journal.mark_manual_recovery(buffer.record_ids, f"outer_persist_unconfirmed:{reason}")
         except JournalError as exc:
             self.logger.exception(f"[Debounce] 合并后更新 journal 失败，保留原记录: {exc}")
+        if self.config.debug_logging:
+            self.logger.info(f"[Debounce] release_reason={reason} text_length={len(getattr(message, 'content_text', '') or '')}")
         return MsgSignal.FORCE_TRIGGER
 
     async def _on_timeout(self, chat_key: str, generation: int) -> None:
@@ -254,56 +369,87 @@ class DebounceRuntime:
             buffer = self.buffers.get(chat_key)
             if buffer is None or buffer.generation != generation or not buffer.messages:
                 return
-            record_ids = buffer.record_ids
-            try:
-                await self.journal.mark_flushing(record_ids)
-            except JournalError as exc:
-                key = (chat_key, generation)
-                failures = self._timeout_state_failures.get(key, 0) + 1
-                self._timeout_state_failures[key] = failures
-                self.logger.exception(f"[Debounce] timeout 状态写入失败，第 {failures} 次: {exc}")
-                try:
-                    await self.journal.transition(
-                        record_ids,
-                        JournalState.PENDING,
-                        error_state="timeout_state_write_failed",
-                        increment_retries=True,
-                    )
-                except JournalError as journal_exc:
-                    self.logger.exception(f"[Debounce] timeout 失败状态写入失败: {journal_exc}")
-                if failures <= MAX_TIMEOUT_STATE_RETRIES:
-                    retry_at = time.time() + TIMEOUT_RETRY_DELAY_SECONDS * failures
-                    try:
-                        self.tasks.schedule(chat_key, generation, retry_at)
-                    except Exception as retry_exc:
-                        self.logger.exception(f"[Debounce] timeout 有限重试创建失败: {retry_exc}")
+            now = time.time()
+            if now + 0.01 < buffer.quiet_deadline:
+                self.tasks.schedule(chat_key, generation, buffer.quiet_deadline)
+                return
+
+            reason: str | None = None
+            if buffer.classifier_fallback:
+                reason = "classifier_unavailable_time_fallback"
+            else:
+                result = await self._classify_buffer(buffer)
+                if result is None:
+                    reason = "classifier_unavailable_time_fallback"
+                elif result.complete:
+                    reason = "quiet_and_complete"
+                elif now >= buffer.max_wait_deadline:
+                    reason = "max_wait_fallback"
                 else:
+                    next_deadline = min(now + self.quiet_seconds, buffer.max_wait_deadline)
+                    buffer.quiet_deadline = next_deadline
+                    buffer.timeout_at = next_deadline
                     try:
-                        await self.journal.mark_manual_recovery(record_ids, "timeout_state_write_exhausted")
-                        self.buffers.clear(chat_key, generation)
-                    except JournalError as journal_exc:
-                        self.logger.exception(f"[Debounce] timeout 达到重试上限且无法标记人工恢复: {journal_exc}")
-                return
+                        await self.journal.update_batch(
+                            buffer.record_ids,
+                            timeout_at=next_deadline,
+                            quiet_deadline=next_deadline,
+                        )
+                    except JournalError as exc:
+                        self.logger.exception(f"[Debounce] 保存下一次静默截止时间失败: {exc}")
+                    self.tasks.schedule(chat_key, generation, next_deadline)
+                    if self.config.debug_logging:
+                        self.logger.info(
+                            f"[Debounce] release_reason=semantic_incomplete_wait "
+                            f"elapsed={max(0.0, now - buffer.first_seen_at):.1f}s",
+                        )
+                    return
 
-            buffer = self.buffers.take(chat_key, generation)
-            if buffer is None or not buffer.messages:
-                return
-            self._timeout_state_failures.pop((chat_key, generation), None)
+            await self._flush_after_timeout(buffer, reason or "timeout")
 
-            try:
-                await self._replay_as_human_message(buffer)
-            except Exception as exc:
-                self.logger.exception(f"[Debounce] timeout 用户消息重放失败，保留人工恢复记录: {exc}")
+    async def _flush_after_timeout(self, buffer: ChatBuffer, reason: str) -> None:
+        record_ids = buffer.record_ids
+        try:
+            await self.journal.update_batch(record_ids, release_reason=reason)
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] 保存 timeout 释放原因失败: {exc}")
+        try:
+            await self.journal.mark_flushing(record_ids)
+        except JournalError as exc:
+            key = (buffer.chat_key, buffer.generation)
+            failures = self._timeout_state_failures.get(key, 0) + 1
+            self._timeout_state_failures[key] = failures
+            self.logger.exception(f"[Debounce] timeout 状态写入失败，第 {failures} 次: {exc}")
+            if failures <= MAX_TIMEOUT_STATE_RETRIES:
+                retry_at = time.time() + TIMEOUT_RETRY_DELAY_SECONDS * failures
+                self.tasks.schedule(buffer.chat_key, buffer.generation, retry_at)
+            else:
                 try:
-                    await self.journal.mark_manual_recovery(record_ids, "timeout_human_replay_failed")
-                except JournalError:
-                    pass
-                return
+                    await self.journal.mark_manual_recovery(record_ids, "timeout_state_write_exhausted")
+                    self.buffers.clear(buffer.chat_key, buffer.generation)
+                except JournalError as journal_exc:
+                    self.logger.exception(f"[Debounce] timeout 达到重试上限且无法标记人工恢复: {journal_exc}")
+            return
 
+        taken = self.buffers.take(buffer.chat_key, buffer.generation)
+        if taken is None:
+            return
+        try:
+            await self._replay_as_human_message(taken)
+        except Exception as exc:
+            self.logger.exception(f"[Debounce] timeout 用户消息重放失败，保留人工恢复记录: {exc}")
             try:
-                await self.journal.acknowledge(record_ids)
-            except JournalError as exc:
-                self.logger.exception(f"[Debounce] timeout 已调用但 journal 清理失败: {exc}")
+                await self.journal.mark_manual_recovery(record_ids, f"timeout_human_replay_failed:{reason}")
+            except JournalError:
+                pass
+            return
+
+        try:
+            await self.journal.acknowledge(record_ids)
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] timeout 已调用但 journal 清理失败: {exc}")
+        if self.config.debug_logging:
+            self.logger.info(f"[Debounce] release_reason={reason} text_length={len(taken.text)}")
 
     async def _replay_as_human_message(self, buffer: ChatBuffer) -> None:
         """将超时缓冲重新交给用户消息入口，避免生成 SYSTEM 消息。"""
@@ -317,7 +463,6 @@ class DebounceRuntime:
         content_text, content_data = merge_message_content(
             [(item.text, item.content_data) for item in buffer.messages],
         )
-
         message = ChatMessage(
             message_id=f"debounce-{buffer.generation}-{last_message.message_id or last_message.event_id}",
             sender_id=last_message.sender_id or "0",

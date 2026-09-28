@@ -1,10 +1,10 @@
-"""NekroAgent AstrBot 兼容消息防抖插件。"""
+"""NekroAgent 消息防抖插件。"""
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from nekro_agent.api.plugin import ConfigBase, NekroPlugin
 
@@ -12,8 +12,8 @@ from nekro_agent.api.plugin import ConfigBase, NekroPlugin
 plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
-    description="使用 ONNX 完整性模型合并连续消息，兼容 AstrBot 防抖配置语义。",
-    version="0.2.0",
+    description="结合语义完整性和静默时间窗口合并连续消息。",
+    version="0.3.0",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -23,11 +23,6 @@ plugin = NekroPlugin(
 
 @plugin.mount_config()
 class DebounceConfig(ConfigBase):
-    debounce_mode: Literal["semantic", "time"] = Field(
-        default="semantic",
-        title="防抖模式",
-        description="semantic: 使用完整性模型；time: 仅等待固定时间后发送。",
-    )
     model_type: Literal["small", "normal"] = Field(
         default="small",
         title="模型类型",
@@ -44,7 +39,13 @@ class DebounceConfig(ConfigBase):
         default=10,
         ge=0,
         title="缓存超时时间（秒）",
-        description="设为 0 表示不自动超时发送。",
+        description="最后一条消息后的静默观察时间。",
+    )
+    max_wait_seconds: int = Field(
+        default=60,
+        ge=1,
+        title="最大等待时间（秒）",
+        description="从第一条消息开始计算的最大等待时间。",
     )
     enabled: bool = Field(default=True, title="启用消息防抖")
     usage_scope: Literal["both", "group", "private"] = Field(
@@ -60,8 +61,14 @@ class DebounceConfig(ConfigBase):
     debug_logging: bool = Field(
         default=False,
         title="启用调试日志",
-        description="开启后记录完整性概率、阈值和判定结果。",
+        description="开启后记录完整性概率、阈值、等待状态和释放原因。",
     )
+
+    @model_validator(mode="after")
+    def validate_waiting_window(self) -> "DebounceConfig":
+        if self.max_wait_seconds < self.timeout_seconds:
+            raise ValueError("最大等待时间必须大于或等于静默观察时间")
+        return self
 
 
 config = plugin.get_config(DebounceConfig)
