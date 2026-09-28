@@ -24,7 +24,7 @@ from .compat import (
     usage_scope_matches,
 )
 from .journal import JournalError, JournalStore
-from .state import ChatBuffer, JournalRecord, JournalState, MessageEnvelope
+from .state import ChatBuffer, JournalRecord, JournalState, MessageEnvelope, SemanticState
 from .tasks import TaskManager
 
 
@@ -56,6 +56,12 @@ class DebounceRuntime:
     @property
     def quiet_seconds(self) -> float:
         return max(0.0, float(self.config.timeout_seconds))
+
+    @property
+    def high_confidence_quiet_seconds(self) -> float:
+        if self.quiet_seconds <= 0:
+            return 0.0
+        return min(self.quiet_seconds, float(self.config.high_confidence_timeout_seconds))
 
     async def start(self) -> None:
         if self._started:
@@ -119,7 +125,12 @@ class DebounceRuntime:
                 max_wait_deadline=max_wait_deadline,
                 semantic_complete=latest.semantic_complete,
                 semantic_probability=latest.semantic_probability,
+                previous_probability=latest.previous_probability,
+                probability_delta=latest.probability_delta,
+                semantic_state=latest.semantic_state,
                 semantic_checked_at=latest.semantic_checked_at,
+                classification_count=latest.classification_count,
+                selected_wait_seconds=latest.selected_wait_seconds,
                 classifier_fallback=any(record.classifier_fallback for record in batch),
             )
             try:
@@ -161,11 +172,8 @@ class DebounceRuntime:
                 return MsgSignal.BLOCK_ALL
 
             result = await self._classify_buffer(buffer)
-            if self.config.debug_logging:
-                status = "classifier_unavailable_time_fallback"
-                if result is not None:
-                    status = "semantic_complete_waiting_quiet" if result.complete else "semantic_incomplete_wait"
-                self.logger.info(f"[Debounce] status={status} text_length={len(buffer.text)}")
+            if result is not None and not await self._apply_wait_policy(buffer):
+                return MsgSignal.CONTINUE
             return MsgSignal.BLOCK_ALL
 
     async def _buffer_message(self, message: Any, current_buffer: ChatBuffer | None) -> ChatBuffer | None:
@@ -180,7 +188,11 @@ class DebounceRuntime:
             classifier_fallback = False
             semantic_complete = None
             semantic_probability = None
+            previous_probability = None
+            probability_delta = None
+            semantic_state = None
             semantic_checked_at = 0.0
+            classification_count = 0
         else:
             generation = current_buffer.generation
             sequence = len(current_buffer.messages)
@@ -189,7 +201,11 @@ class DebounceRuntime:
             classifier_fallback = current_buffer.classifier_fallback
             semantic_complete = current_buffer.semantic_complete
             semantic_probability = current_buffer.semantic_probability
+            previous_probability = current_buffer.previous_probability
+            probability_delta = current_buffer.probability_delta
+            semantic_state = current_buffer.semantic_state
             semantic_checked_at = current_buffer.semantic_checked_at
+            classification_count = current_buffer.classification_count
         quiet_deadline = min(now + self.quiet_seconds, max_wait_deadline)
         event_id = message_event_id(message)
         record = JournalRecord(
@@ -213,7 +229,12 @@ class DebounceRuntime:
             max_wait_deadline=max_wait_deadline,
             semantic_complete=semantic_complete,
             semantic_probability=semantic_probability,
+            previous_probability=previous_probability,
+            probability_delta=probability_delta,
+            semantic_state=semantic_state,
             semantic_checked_at=semantic_checked_at,
+            classification_count=classification_count,
+            selected_wait_seconds=self.quiet_seconds,
             classifier_fallback=classifier_fallback,
         )
         try:
@@ -259,7 +280,12 @@ class DebounceRuntime:
         buffer.classifier_fallback = classifier_fallback
         buffer.semantic_complete = semantic_complete
         buffer.semantic_probability = semantic_probability
+        buffer.previous_probability = previous_probability
+        buffer.probability_delta = probability_delta
+        buffer.semantic_state = semantic_state
         buffer.semantic_checked_at = semantic_checked_at
+        buffer.classification_count = classification_count
+        buffer.selected_wait_seconds = self.quiet_seconds
         try:
             await self.journal.update_batch(
                 buffer.record_ids,
@@ -267,6 +293,7 @@ class DebounceRuntime:
                 quiet_deadline=quiet_deadline,
                 timeout_at=quiet_deadline,
                 max_wait_deadline=max_wait_deadline,
+                selected_wait_seconds=self.quiet_seconds,
                 classifier_fallback=classifier_fallback,
             )
         except JournalError as exc:
@@ -294,10 +321,21 @@ class DebounceRuntime:
         return buffer
 
     async def _classify_buffer(self, buffer: ChatBuffer) -> ClassificationResult | None:
+        previous_probability = buffer.semantic_probability
         try:
-            result = await self.classifier.classify(buffer.text, float(self.config.send_threshold))
+            result = await self.classifier.classify(
+                buffer.text,
+                float(self.config.send_threshold),
+                float(self.config.high_confidence_threshold),
+            )
         except Exception as exc:
             buffer.classifier_fallback = True
+            buffer.semantic_complete = None
+            buffer.semantic_probability = None
+            buffer.previous_probability = previous_probability
+            buffer.probability_delta = None
+            buffer.semantic_state = None
+            buffer.selected_wait_seconds = self.quiet_seconds
             self.logger.warning(f"[Debounce] 当前批次退化为时间防抖: {exc}")
             try:
                 await self.journal.update_batch(
@@ -305,22 +343,37 @@ class DebounceRuntime:
                     classifier_fallback=True,
                     semantic_complete=None,
                     semantic_probability=None,
+                    previous_probability=previous_probability,
+                    probability_delta=None,
+                    semantic_state=None,
                     semantic_checked_at=time.time(),
+                    selected_wait_seconds=self.quiet_seconds,
                 )
             except JournalError as journal_exc:
                 self.logger.exception(f"[Debounce] 保存分类器降级状态失败: {journal_exc}")
             return None
 
         checked_at = time.time()
+        state = result.semantic_state or self._semantic_state(result.probability)
         buffer.semantic_complete = result.complete
         buffer.semantic_probability = result.probability
+        buffer.previous_probability = previous_probability
+        buffer.probability_delta = (
+            result.probability - previous_probability if previous_probability is not None else None
+        )
+        buffer.semantic_state = state
         buffer.semantic_checked_at = checked_at
+        buffer.classification_count += 1
         try:
             await self.journal.update_batch(
                 buffer.record_ids,
                 semantic_complete=result.complete,
                 semantic_probability=result.probability,
+                previous_probability=buffer.previous_probability,
+                probability_delta=buffer.probability_delta,
+                semantic_state=state,
                 semantic_checked_at=checked_at,
+                classification_count=buffer.classification_count,
                 classifier_fallback=False,
             )
         except JournalError as exc:
@@ -328,11 +381,68 @@ class DebounceRuntime:
         if self.config.debug_logging:
             self.logger.info(
                 f"[Debounce] chat={self._debug_chat_key(buffer.chat_key)} "
-                f"text_length={len(buffer.text)} probability={result.probability:.4f} "
+                f"text_length={len(buffer.text)} messages={len(buffer.messages)} "
+                f"previous_probability={self._format_probability(buffer.previous_probability)} "
+                f"probability={result.probability:.4f} "
+                f"probability_delta={self._format_probability(buffer.probability_delta)} "
                 f"threshold={float(self.config.send_threshold):.4f} "
-                f"complete={result.complete} elapsed={max(0.0, checked_at - buffer.first_seen_at):.1f}s",
+                f"high_threshold={float(self.config.high_confidence_threshold):.4f} "
+                f"state={state.value} first_message={len(buffer.messages) == 1} "
+                f"elapsed={max(0.0, checked_at - buffer.first_seen_at):.1f}s",
             )
         return result
+
+    def _semantic_state(self, probability: float) -> SemanticState:
+        if probability < float(self.config.send_threshold):
+            return SemanticState.INCOMPLETE
+        if probability >= float(self.config.high_confidence_threshold):
+            return SemanticState.COMPLETE_HIGH
+        return SemanticState.COMPLETE_NORMAL
+
+    @staticmethod
+    def _format_probability(probability: float | None) -> str:
+        return "none" if probability is None else f"{probability:.4f}"
+
+    def _wait_seconds_for(self, buffer: ChatBuffer) -> tuple[float, str]:
+        if len(buffer.messages) > 1 and buffer.semantic_state == SemanticState.COMPLETE_HIGH:
+            return self.high_confidence_quiet_seconds, "semantic_complete_high_confidence_short_wait"
+        if buffer.semantic_state == SemanticState.INCOMPLETE:
+            return self.quiet_seconds, "semantic_incomplete_wait"
+        return self.quiet_seconds, "semantic_complete_normal_wait"
+
+    async def _apply_wait_policy(self, buffer: ChatBuffer) -> bool:
+        wait_seconds, status = self._wait_seconds_for(buffer)
+        now = time.time()
+        deadline = min(now + wait_seconds, buffer.max_wait_deadline)
+        buffer.selected_wait_seconds = wait_seconds
+        buffer.quiet_deadline = deadline
+        buffer.timeout_at = deadline
+        try:
+            await self.journal.update_batch(
+                buffer.record_ids,
+                timeout_at=deadline,
+                quiet_deadline=deadline,
+                selected_wait_seconds=wait_seconds,
+            )
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] 保存等待窗口失败，当前消息放行: {exc}")
+            try:
+                await self.journal.mark_manual_recovery(buffer.record_ids, "wait_policy_persist_failed")
+            except JournalError:
+                pass
+            self.buffers.clear(buffer.chat_key, buffer.generation)
+            self.tasks.cancel(buffer.chat_key, buffer.generation)
+            return False
+        try:
+            self.tasks.schedule(buffer.chat_key, buffer.generation, deadline)
+        except Exception as exc:
+            self.logger.exception(f"[Debounce] 更新 timeout 任务失败，保留 journal 等待恢复: {exc}")
+        if self.config.debug_logging:
+            self.logger.info(
+                f"[Debounce] status={status} selected_wait_seconds={wait_seconds:.1f} "
+                f"elapsed={max(0.0, now - buffer.first_seen_at):.1f}s",
+            )
+        return True
 
     def _debug_chat_key(self, chat_key: str) -> str:
         return f"{chat_key[:4]}...{chat_key[-4:]}" if len(chat_key) > 8 else chat_key
@@ -389,11 +499,13 @@ class DebounceRuntime:
                     next_deadline = min(now + self.quiet_seconds, buffer.max_wait_deadline)
                     buffer.quiet_deadline = next_deadline
                     buffer.timeout_at = next_deadline
+                    buffer.selected_wait_seconds = self.quiet_seconds
                     try:
                         await self.journal.update_batch(
                             buffer.record_ids,
                             timeout_at=next_deadline,
                             quiet_deadline=next_deadline,
+                            selected_wait_seconds=self.quiet_seconds,
                         )
                     except JournalError as exc:
                         self.logger.exception(f"[Debounce] 保存下一次静默截止时间失败: {exc}")
