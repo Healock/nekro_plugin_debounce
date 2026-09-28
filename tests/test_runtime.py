@@ -97,6 +97,28 @@ async def test_each_message_reclassifies_accumulated_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_new_message_resets_quiet_deadline_only() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=10, max_wait_seconds=60))
+    runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
+    first = Message(message_id="deadline-1", content_text="第一段", content_data=[{"type": "text", "text": "第一段"}])
+    second = Message(message_id="deadline-2", content_text="第二段", content_data=[{"type": "text", "text": "第二段"}])
+    await runtime.handle_user_message(None, first)
+    buffer = runtime.buffers.get("chat")
+    assert buffer is not None
+    first_max_wait = buffer.max_wait_deadline
+    first_quiet = buffer.quiet_deadline
+    await runtime.handle_user_message(None, second)
+    buffer = runtime.buffers.get("chat")
+    assert buffer is not None
+    assert buffer.quiet_deadline > first_quiet
+    assert buffer.max_wait_deadline == first_max_wait
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_incomplete_timeout_waits_then_max_wait_forces_release() -> None:
     from nekro_plugin_debounce import plugin
 
