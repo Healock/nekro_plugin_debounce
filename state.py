@@ -33,6 +33,10 @@ class JournalRecord(BaseModel):
     last_message_id: str = ""
     sender_id: str = ""
     sender_name: str = ""
+    sender_nickname: str = ""
+    adapter_key: str = ""
+    platform_userid: str = ""
+    raw_cq_code: str = ""
     updated_at: float
     timeout_at: float
     retries: int = 0
@@ -61,6 +65,10 @@ class MessageEnvelope:
     content_data: list[dict[str, Any]] = field(default_factory=list)
     sender_id: str = ""
     sender_name: str = ""
+    sender_nickname: str = ""
+    adapter_key: str = ""
+    platform_userid: str = ""
+    raw_cq_code: str = ""
 
 
 @dataclass(slots=True)

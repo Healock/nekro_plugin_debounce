@@ -8,6 +8,7 @@ from typing import Any
 
 
 SAFE_SEGMENT_TYPES = {"text", "at"}
+REPLAY_MARKER = "_nekro_plugin_debounce_replay"
 
 
 def segment_type_name(segment: Any) -> str:
@@ -74,6 +75,13 @@ def sender_id(message: Any) -> str:
 
 def sender_name(message: Any) -> str:
     return str(getattr(message, "sender_name", "") or getattr(message, "sender_nickname", "") or "")
+
+
+def is_replay_message(message: Any) -> bool:
+    """判断消息是否由防抖超时流程重新提交。"""
+
+    ext_data = getattr(message, "ext_data", None)
+    return isinstance(ext_data, Mapping) and ext_data.get(REPLAY_MARKER) is True
 
 
 def text_compatible(message: Any) -> bool:

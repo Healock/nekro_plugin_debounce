@@ -13,7 +13,7 @@ plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
     description="使用 ONNX 完整性模型合并连续消息，兼容 AstrBot 防抖配置语义。",
-    version="0.1.0",
+    version="0.1.1",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -50,7 +50,7 @@ class DebounceConfig(ConfigBase):
     cancel_on_new_message: bool = Field(
         default=True,
         title="新消息时取消旧回复",
-        description="保留 AstrBot 配置字段；Nekro v0.1.0 不伪造 Agent 取消。",
+        description="保留 AstrBot 配置字段；Nekro v0.1.1 不伪造 Agent 取消。",
     )
 
 

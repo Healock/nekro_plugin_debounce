@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from nekro_plugin_debounce.compat import (
     has_hard_boundary,
+    is_replay_message,
     merge_into_message,
     text_compatible,
     usage_scope_matches,
@@ -49,3 +50,10 @@ def test_usage_scope_matches_chat_type() -> None:
     assert usage_scope_matches(group, "group")
     assert not usage_scope_matches(group, "private")
     assert usage_scope_matches(private, "private")
+
+
+def test_replay_marker_is_explicit() -> None:
+    assert is_replay_message(Message()) is False
+    message = Message()
+    message.ext_data = {"_nekro_plugin_debounce_replay": True}  # type: ignore[attr-defined]
+    assert is_replay_message(message) is True
