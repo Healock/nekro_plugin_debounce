@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import time
 
@@ -110,6 +111,7 @@ async def test_new_message_resets_quiet_deadline_only() -> None:
     assert buffer is not None
     first_max_wait = buffer.max_wait_deadline
     first_quiet = buffer.quiet_deadline
+    await asyncio.sleep(0.02)
     await runtime.handle_user_message(None, second)
     buffer = runtime.buffers.get("chat")
     assert buffer is not None
