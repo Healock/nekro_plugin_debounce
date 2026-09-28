@@ -18,6 +18,14 @@ class JournalState(StrEnum):
     ACKED = "acked"
 
 
+class SemanticState(StrEnum):
+    """累计文本当前的语义完整性状态。"""
+
+    INCOMPLETE = "incomplete"
+    COMPLETE_NORMAL = "complete_normal"
+    COMPLETE_HIGH = "complete_high"
+
+
 class JournalRecord(BaseModel):
     """可恢复的单条用户消息。"""
 
@@ -44,7 +52,12 @@ class JournalRecord(BaseModel):
     max_wait_deadline: float = 0.0
     semantic_complete: bool | None = None
     semantic_probability: float | None = None
+    previous_probability: float | None = None
+    probability_delta: float | None = None
+    semantic_state: SemanticState | None = None
     semantic_checked_at: float = 0.0
+    classification_count: int = 0
+    selected_wait_seconds: float = 0.0
     classifier_fallback: bool = False
     release_reason: str = ""
     retries: int = 0
@@ -93,7 +106,12 @@ class ChatBuffer:
     max_wait_deadline: float = 0.0
     semantic_complete: bool | None = None
     semantic_probability: float | None = None
+    previous_probability: float | None = None
+    probability_delta: float | None = None
+    semantic_state: SemanticState | None = None
     semantic_checked_at: float = 0.0
+    classification_count: int = 0
+    selected_wait_seconds: float = 0.0
     classifier_fallback: bool = False
 
     @property

@@ -126,7 +126,12 @@ class JournalStore:
             "max_wait_deadline",
             "semantic_complete",
             "semantic_probability",
+            "previous_probability",
+            "probability_delta",
+            "semantic_state",
             "semantic_checked_at",
+            "classification_count",
+            "selected_wait_seconds",
             "classifier_fallback",
             "release_reason",
         }

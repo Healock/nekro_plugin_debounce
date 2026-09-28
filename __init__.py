@@ -13,7 +13,7 @@ plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
     description="结合语义完整性和静默时间窗口合并连续消息。",
-    version="0.3.0",
+    version="0.4.0",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -35,11 +35,24 @@ class DebounceConfig(ConfigBase):
         title="完整性概率阈值",
         description="达到该概率后发送合并消息。",
     )
+    high_confidence_threshold: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        title="高置信度阈值",
+        description="达到该概率后，后续消息使用较短的静默观察时间。",
+    )
     timeout_seconds: int = Field(
         default=10,
         ge=0,
         title="缓存超时时间（秒）",
         description="最后一条消息后的静默观察时间。",
+    )
+    high_confidence_timeout_seconds: int = Field(
+        default=2,
+        ge=1,
+        title="高置信度静默时间（秒）",
+        description="后续消息达到高置信度完整时使用的静默观察时间。",
     )
     max_wait_seconds: int = Field(
         default=60,
@@ -68,6 +81,12 @@ class DebounceConfig(ConfigBase):
     def validate_waiting_window(self) -> "DebounceConfig":
         if self.max_wait_seconds < self.timeout_seconds:
             raise ValueError("最大等待时间必须大于或等于静默观察时间")
+        if self.high_confidence_threshold < self.send_threshold:
+            raise ValueError("高置信度阈值必须大于或等于完整性概率阈值")
+        if self.timeout_seconds > 0 and self.high_confidence_timeout_seconds > self.timeout_seconds:
+            if "high_confidence_timeout_seconds" in self.model_fields_set:
+                raise ValueError("高置信度静默时间不能大于普通静默时间")
+            self.high_confidence_timeout_seconds = self.timeout_seconds
         return self
 
 

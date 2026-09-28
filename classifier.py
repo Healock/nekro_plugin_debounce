@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from .state import SemanticState
+
 
 MODEL_REPOSITORIES = {
     "small": "advent259141/astrbot_debouncer_small",
@@ -24,6 +26,7 @@ class ClassifierUnavailable(RuntimeError):
 class ClassificationResult:
     probability: float
     complete: bool
+    semantic_state: SemanticState | None = None
 
 
 def send_probability(logits: Any) -> float:
@@ -145,9 +148,20 @@ class ClassifierAdapter:
             raise ClassifierUnavailable(f"模型不存在且下载失败: {exc}") from exc
 
     async def is_complete(self, text: str, threshold: float) -> bool:
-        return (await self.classify(text, threshold)).complete
+        return (await self.classify(text, threshold, threshold)).complete
 
-    async def classify(self, text: str, threshold: float) -> ClassificationResult:
+    async def classify(self, text: str, threshold: float, high_threshold: float | None = None) -> ClassificationResult:
         classifier = await self._ensure_loaded()
         score = await classifier.predict(text)
-        return ClassificationResult(probability=score, complete=score >= threshold)
+        high_threshold = threshold if high_threshold is None else high_threshold
+        if score < threshold:
+            state = SemanticState.INCOMPLETE
+        elif score >= high_threshold:
+            state = SemanticState.COMPLETE_HIGH
+        else:
+            state = SemanticState.COMPLETE_NORMAL
+        return ClassificationResult(
+            probability=score,
+            complete=score >= threshold,
+            semantic_state=state,
+        )

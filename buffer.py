@@ -7,7 +7,7 @@ import time
 from collections.abc import Iterable
 from typing import Optional
 
-from .state import ChatBuffer, MessageEnvelope
+from .state import ChatBuffer, MessageEnvelope, SemanticState
 
 
 class BufferManager:
@@ -88,7 +88,12 @@ class BufferManager:
         max_wait_deadline: float,
         semantic_complete: bool | None = None,
         semantic_probability: float | None = None,
+        previous_probability: float | None = None,
+        probability_delta: float | None = None,
+        semantic_state: SemanticState | None = None,
         semantic_checked_at: float = 0.0,
+        classification_count: int = 0,
+        selected_wait_seconds: float = 0.0,
         classifier_fallback: bool = False,
     ) -> None:
         grouped: dict[tuple[str, int], list[MessageEnvelope]] = {}
@@ -111,7 +116,12 @@ class BufferManager:
                 max_wait_deadline=max_wait_deadline,
                 semantic_complete=semantic_complete,
                 semantic_probability=semantic_probability,
+                previous_probability=previous_probability,
+                probability_delta=probability_delta,
+                semantic_state=semantic_state,
                 semantic_checked_at=semantic_checked_at,
+                classification_count=classification_count,
+                selected_wait_seconds=selected_wait_seconds,
                 classifier_fallback=classifier_fallback,
             )
             self._buffers[chat_key] = buffer
