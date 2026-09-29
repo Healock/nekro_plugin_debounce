@@ -1,6 +1,6 @@
 # NekroAgent 消息防抖
 
-版本：`0.4.2`
+版本：`0.4.3`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
@@ -45,7 +45,7 @@
 ## 消息边界
 
 - `mount_on_user_message` 能看到的命令、`is_tome` 和显式 @ 不会在插件内额外绕过；上游已经消费、没有进入回调的命令不由本插件处理。
-- 使用 `ChatMessage.chat_key` 做频道级缓冲，不按 sender 分桶。群聊合并后原生 sender 元数据可能代表最后一条消息。
+- 群聊按“频道 + 发送者”分别缓冲，不同发送者的消息不会合并到同一条 Agent 输入中；同一发送者的连续消息仍按原策略合并。私聊按用户频道独立缓冲。
 - 已有 pending 文本时，下一条可分类文本会合并到累计文本并再次运行完整性分类器。
 - 纯文本和 AT 可进入分类器。图片、语音、视频、文件、Forward、卡片、戳一戳等非文本段是硬边界：没有 pending 时原样放行，有 pending 时按顺序合并到当前 `ChatMessage`，保留 `content_data` 并直接触发。
 

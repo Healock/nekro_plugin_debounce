@@ -77,6 +77,27 @@ def sender_name(message: Any) -> str:
     return str(getattr(message, "sender_name", "") or getattr(message, "sender_nickname", "") or "")
 
 
+def sender_bucket(message: Any) -> str:
+    """返回稳定的发送者分桶标识，不改变真实频道标识。"""
+
+    for value in (
+        getattr(message, "sender_id", ""),
+        getattr(message, "platform_userid", ""),
+        getattr(message, "sender_name", ""),
+        getattr(message, "sender_nickname", ""),
+    ):
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    return "unknown"
+
+
+def buffer_key(chat_key: str, sender_key: str) -> str:
+    """生成仅供插件内部使用的频道与发送者复合键。"""
+
+    return f"{chat_key}\x1f{sender_key}"
+
+
 def is_replay_message(message: Any) -> bool:
     """判断消息是否由防抖超时流程重新提交。"""
 

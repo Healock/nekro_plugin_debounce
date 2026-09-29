@@ -33,6 +33,7 @@ class JournalRecord(BaseModel):
 
     event_id: str
     chat_key: str
+    sender_bucket: str = ""
     generation: int = 0
     sequence: int = 0
     state: JournalState = JournalState.PENDING
@@ -84,6 +85,7 @@ class MessageEnvelope:
     generation: int
     sequence: int
     text: str
+    sender_bucket: str = ""
     content_data: list[dict[str, Any]] = field(default_factory=list)
     sender_id: str = ""
     sender_name: str = ""
@@ -93,6 +95,10 @@ class MessageEnvelope:
     raw_cq_code: str = ""
     received_at: float = 0.0
 
+    @property
+    def buffer_key(self) -> str:
+        return f"{self.chat_key}\x1f{self.sender_bucket}"
+
 
 @dataclass(slots=True)
 class ChatBuffer:
@@ -100,6 +106,8 @@ class ChatBuffer:
 
     chat_key: str
     generation: int
+    buffer_key: str = ""
+    sender_bucket: str = ""
     messages: list[MessageEnvelope] = field(default_factory=list)
     last_update: float = 0.0
     timeout_at: float = 0.0

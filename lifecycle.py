@@ -12,6 +12,7 @@ from .buffer import BufferManager
 from .classifier import ClassificationResult, ClassifierAdapter
 from .compat import (
     REPLAY_MARKER,
+    buffer_key,
     content_data_to_dicts,
     has_hard_boundary,
     is_replay_message,
@@ -22,6 +23,7 @@ from .compat import (
     restore_segments,
     sender_id,
     sender_name,
+    sender_bucket,
     usage_scope_matches,
 )
 from .journal import JournalError, JournalStore
@@ -91,16 +93,21 @@ class DebounceRuntime:
             except JournalError as exc:
                 self.logger.exception(f"[Debounce] 标记人工恢复失败: {exc}")
 
-        grouped: dict[tuple[str, int], list[JournalRecord]] = {}
+        grouped: dict[tuple[str, str, int], list[JournalRecord]] = {}
         for record in pending:
-            grouped.setdefault((record.chat_key, record.generation), []).append(record)
-        for (chat_key, generation), batch in grouped.items():
+            grouped.setdefault(
+                (record.chat_key, record.sender_bucket or record.sender_id or "unknown", record.generation),
+                [],
+            ).append(record)
+        for (chat_key, sender_key, generation), batch in grouped.items():
             batch.sort(key=lambda item: item.sequence)
+            internal_key = buffer_key(chat_key, sender_key)
             envelopes = [
                 MessageEnvelope(
                     event_id=record.event_id,
                     message_id=record.last_message_id,
                     chat_key=record.chat_key,
+                    sender_bucket=record.sender_bucket or record.sender_id or sender_key,
                     generation=record.generation,
                     sequence=record.sequence,
                     text=record.text,
@@ -125,6 +132,9 @@ class DebounceRuntime:
             self.buffers.restore(
                 envelopes,
                 quiet_deadline,
+                buffer_key=internal_key,
+                chat_key=chat_key,
+                sender_bucket=sender_key,
                 first_seen_at=first_seen_at,
                 max_wait_deadline=max_wait_deadline,
                 semantic_complete=latest.semantic_complete,
@@ -138,7 +148,7 @@ class DebounceRuntime:
                 classifier_fallback=any(record.classifier_fallback for record in batch),
             )
             try:
-                self.tasks.schedule(chat_key, generation, quiet_deadline)
+                self.tasks.schedule(internal_key, generation, quiet_deadline)
             except Exception as exc:
                 self.logger.exception(f"[Debounce] 恢复 timeout 任务失败: {chat_key}: {exc}")
         self._started = True
@@ -172,35 +182,36 @@ class DebounceRuntime:
         if not chat_key:
             return
         async with self.buffers.lock_for(chat_key):
-            buffer = self.buffers.get(chat_key)
-            if buffer is None or not buffer.messages:
+            buffers = self.buffers.for_chat(chat_key)
+            if not buffers:
                 return
-            count = len(buffer.messages)
-            record_ids = buffer.record_ids
-            try:
-                cleaned = await self.journal.discard(record_ids)
-                if not cleaned:
-                    self.logger.warning(
-                        f"[Debounce] reset 已持久化 ACK，但 journal 物理清理失败: chat={chat_key} "
-                        f"generation={buffer.generation}",
-                    )
-            except JournalError as exc:
-                self.logger.exception(
-                    f"[Debounce] reset 批次 ACK 失败，尝试标记人工恢复: chat={chat_key} "
-                    f"generation={buffer.generation}: {exc}",
-                )
+            count = sum(len(buffer.messages) for buffer in buffers)
+            for buffer in buffers:
+                record_ids = buffer.record_ids
                 try:
-                    await self.journal.mark_manual_recovery(record_ids, "channel_reset")
-                except JournalError as recovery_exc:
-                    self.logger.critical(
-                        f"[Debounce] reset journal 无法持久化取消状态，需人工检查: chat={chat_key} "
-                        f"generation={buffer.generation}: {recovery_exc}",
+                    cleaned = await self.journal.discard(record_ids)
+                    if not cleaned:
+                        self.logger.warning(
+                            f"[Debounce] reset 已持久化 ACK，但 journal 物理清理失败: chat={chat_key} "
+                            f"sender={buffer.sender_bucket} generation={buffer.generation}",
+                        )
+                except JournalError as exc:
+                    self.logger.exception(
+                        f"[Debounce] reset 批次 ACK 失败，尝试标记人工恢复: chat={chat_key} "
+                        f"sender={buffer.sender_bucket} generation={buffer.generation}: {exc}",
                     )
-            self.tasks.cancel(chat_key, buffer.generation)
-            self.buffers.clear(chat_key, buffer.generation)
+                    try:
+                        await self.journal.mark_manual_recovery(record_ids, "channel_reset")
+                    except JournalError as recovery_exc:
+                        self.logger.critical(
+                            f"[Debounce] reset journal 无法持久化取消状态，需人工检查: chat={chat_key} "
+                            f"sender={buffer.sender_bucket} generation={buffer.generation}: {recovery_exc}",
+                        )
+                self.tasks.cancel(buffer.buffer_key, buffer.generation)
+                self.buffers.clear(buffer.buffer_key, buffer.generation)
             self.logger.info(
-                f"[Debounce] reset 已取消 pending 批次: chat={chat_key} "
-                f"generation={buffer.generation} messages={count}",
+                f"[Debounce] reset 已取消 pending 批次: chat={chat_key} messages={count} "
+                f"batches={len(buffers)}",
             )
 
     async def handle_user_message(self, _ctx: Any, message: Any) -> MsgSignal:
@@ -212,9 +223,10 @@ class DebounceRuntime:
         chat_key = str(getattr(message, "chat_key", "") or "")
         if not chat_key:
             return MsgSignal.CONTINUE
+        internal_key = buffer_key(chat_key, sender_bucket(message))
         lock = self.buffers.lock_for(chat_key)
         async with lock:
-            current_buffer = self.buffers.get(chat_key)
+            current_buffer = self.buffers.get(internal_key)
             if has_hard_boundary(message):
                 if current_buffer is None or not current_buffer.messages:
                     return MsgSignal.CONTINUE
@@ -224,7 +236,7 @@ class DebounceRuntime:
             if not current_text.strip() and not getattr(message, "content_data", None):
                 return MsgSignal.CONTINUE
 
-            buffer = await self._buffer_message(message, current_buffer)
+            buffer = await self._buffer_message(message, current_buffer, internal_key)
             if buffer is None:
                 return MsgSignal.CONTINUE
             preload_pending = self._preload_task is not None and not self._preload_task.done()
@@ -239,8 +251,8 @@ class DebounceRuntime:
                         await self.journal.mark_manual_recovery(buffer.record_ids, "preload_state_persist_failed")
                     except JournalError:
                         pass
-                    self.buffers.clear(chat_key, buffer.generation)
-                    self.tasks.cancel(chat_key, buffer.generation)
+                    self.buffers.clear(buffer.buffer_key, buffer.generation)
+                    self.tasks.cancel(buffer.buffer_key, buffer.generation)
                     return MsgSignal.CONTINUE
                 if not await self._apply_wait_policy(buffer):
                     return MsgSignal.CONTINUE
@@ -253,13 +265,19 @@ class DebounceRuntime:
                 return MsgSignal.CONTINUE
             return MsgSignal.BLOCK_ALL
 
-    async def _buffer_message(self, message: Any, current_buffer: ChatBuffer | None) -> ChatBuffer | None:
+    async def _buffer_message(
+        self,
+        message: Any,
+        current_buffer: ChatBuffer | None,
+        internal_key: str,
+    ) -> ChatBuffer | None:
         """持久化一条消息，重置静默窗口但不延长最大等待时间。"""
 
         chat_key = str(getattr(message, "chat_key", "") or "")
+        sender_key = sender_bucket(message)
         now = time.time()
         if current_buffer is None or not current_buffer.messages:
-            generation, sequence = self.buffers.next_position(chat_key)
+            generation, sequence = self.buffers.next_position(internal_key)
             first_seen_at = now
             max_wait_deadline = now + float(self.config.max_wait_seconds)
             classifier_fallback = False
@@ -288,6 +306,7 @@ class DebounceRuntime:
         record = JournalRecord(
             event_id=event_id,
             chat_key=chat_key,
+            sender_bucket=sender_key,
             generation=generation,
             sequence=sequence,
             text=str(getattr(message, "content_text", "") or ""),
@@ -325,6 +344,7 @@ class DebounceRuntime:
             event_id=event_id,
             message_id=message_id(message),
             chat_key=chat_key,
+            sender_bucket=sender_key,
             generation=generation,
             sequence=sequence,
             text=record.text,
@@ -353,8 +373,8 @@ class DebounceRuntime:
                 )
             except JournalError:
                 pass
-            self.buffers.clear(chat_key, generation)
-            self.tasks.cancel(chat_key, generation)
+            self.buffers.clear(internal_key, generation)
+            self.tasks.cancel(internal_key, generation)
             return None
         buffer.classifier_fallback = classifier_fallback
         buffer.semantic_complete = semantic_complete
@@ -381,11 +401,11 @@ class DebounceRuntime:
                 await self.journal.mark_manual_recovery(buffer.record_ids, "batch_deadline_persist_failed")
             except JournalError:
                 pass
-            self.buffers.clear(chat_key, generation)
-            self.tasks.cancel(chat_key, generation)
+            self.buffers.clear(internal_key, generation)
+            self.tasks.cancel(internal_key, generation)
             return None
         try:
-            self.tasks.schedule(chat_key, generation, quiet_deadline)
+            self.tasks.schedule(internal_key, generation, quiet_deadline)
         except Exception as exc:
             self.logger.exception(f"[Debounce] timeout 创建失败，保留 journal 等待恢复: {exc}")
             try:
@@ -523,11 +543,11 @@ class DebounceRuntime:
                 await self.journal.mark_manual_recovery(buffer.record_ids, "wait_policy_persist_failed")
             except JournalError:
                 pass
-            self.buffers.clear(buffer.chat_key, buffer.generation)
-            self.tasks.cancel(buffer.chat_key, buffer.generation)
+            self.buffers.clear(buffer.buffer_key, buffer.generation)
+            self.tasks.cancel(buffer.buffer_key, buffer.generation)
             return False
         try:
-            self.tasks.schedule(buffer.chat_key, buffer.generation, deadline)
+            self.tasks.schedule(buffer.buffer_key, buffer.generation, deadline)
         except Exception as exc:
             self.logger.exception(f"[Debounce] 更新 timeout 任务失败，保留 journal 等待恢复: {exc}")
         if self.config.debug_logging:
@@ -551,8 +571,8 @@ class DebounceRuntime:
             self.logger.exception(f"[Debounce] 消息合并失败，当前消息 fail-open，pending 保留: {exc}")
             try:
                 await self.journal.mark_manual_recovery(buffer.record_ids, f"merge_failed:{reason}")
-                self.buffers.clear(buffer.chat_key, buffer.generation)
-                self.tasks.cancel(buffer.chat_key, buffer.generation)
+                self.buffers.clear(buffer.buffer_key, buffer.generation)
+                self.tasks.cancel(buffer.buffer_key, buffer.generation)
             except JournalError as journal_exc:
                 self.logger.exception(f"[Debounce] 合并失败批次无法标记人工恢复: {journal_exc}")
             return MsgSignal.CONTINUE
@@ -560,8 +580,8 @@ class DebounceRuntime:
             await self.journal.update_batch(buffer.record_ids, release_reason=reason)
         except JournalError as exc:
             self.logger.exception(f"[Debounce] 保存释放原因失败: {exc}")
-        self.buffers.clear(buffer.chat_key, buffer.generation)
-        self.tasks.cancel(buffer.chat_key, buffer.generation)
+        self.buffers.clear(buffer.buffer_key, buffer.generation)
+        self.tasks.cancel(buffer.buffer_key, buffer.generation)
         try:
             await self.journal.mark_manual_recovery(buffer.record_ids, f"outer_persist_unconfirmed:{reason}")
         except JournalError as exc:
@@ -570,15 +590,18 @@ class DebounceRuntime:
             self.logger.info(f"[Debounce] release_reason={reason} text_length={len(getattr(message, 'content_text', '') or '')}")
         return MsgSignal.FORCE_TRIGGER
 
-    async def _on_timeout(self, chat_key: str, generation: int) -> None:
-        lock = self.buffers.lock_for(chat_key)
+    async def _on_timeout(self, internal_key: str, generation: int) -> None:
+        buffer = self.buffers.get(internal_key)
+        if buffer is None:
+            return
+        lock = self.buffers.lock_for(buffer.chat_key)
         async with lock:
-            buffer = self.buffers.get(chat_key)
+            buffer = self.buffers.get(internal_key)
             if buffer is None or buffer.generation != generation or not buffer.messages:
                 return
             now = time.time()
             if now + 0.01 < buffer.quiet_deadline:
-                self.tasks.schedule(chat_key, generation, buffer.quiet_deadline)
+                self.tasks.schedule(internal_key, generation, buffer.quiet_deadline)
                 return
 
             reason: str | None = None
@@ -607,7 +630,7 @@ class DebounceRuntime:
                         )
                     except JournalError as exc:
                         self.logger.exception(f"[Debounce] 保存下一次静默截止时间失败: {exc}")
-                    self.tasks.schedule(chat_key, generation, next_deadline)
+                    self.tasks.schedule(internal_key, generation, next_deadline)
                     if self.config.debug_logging:
                         self.logger.info(
                             f"[Debounce] release_reason=semantic_incomplete_wait "
@@ -626,22 +649,22 @@ class DebounceRuntime:
         try:
             await self.journal.mark_flushing(record_ids)
         except JournalError as exc:
-            key = (buffer.chat_key, buffer.generation)
+            key = (buffer.buffer_key, buffer.generation)
             failures = self._timeout_state_failures.get(key, 0) + 1
             self._timeout_state_failures[key] = failures
             self.logger.exception(f"[Debounce] timeout 状态写入失败，第 {failures} 次: {exc}")
             if failures <= MAX_TIMEOUT_STATE_RETRIES:
                 retry_at = time.time() + TIMEOUT_RETRY_DELAY_SECONDS * failures
-                self.tasks.schedule(buffer.chat_key, buffer.generation, retry_at)
+                self.tasks.schedule(buffer.buffer_key, buffer.generation, retry_at)
             else:
                 try:
                     await self.journal.mark_manual_recovery(record_ids, "timeout_state_write_exhausted")
-                    self.buffers.clear(buffer.chat_key, buffer.generation)
+                    self.buffers.clear(buffer.buffer_key, buffer.generation)
                 except JournalError as journal_exc:
                     self.logger.exception(f"[Debounce] timeout 达到重试上限且无法标记人工恢复: {journal_exc}")
             return
 
-        taken = self.buffers.take(buffer.chat_key, buffer.generation)
+        taken = self.buffers.take(buffer.buffer_key, buffer.generation)
         if taken is None:
             return
         try:

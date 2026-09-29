@@ -21,17 +21,21 @@ class BufferManager:
     def lock_for(self, chat_key: str) -> asyncio.Lock:
         return self._locks.setdefault(chat_key, asyncio.Lock())
 
-    def get(self, chat_key: str) -> Optional[ChatBuffer]:
-        return self._buffers.get(chat_key)
+    def get(self, buffer_key: str) -> Optional[ChatBuffer]:
+        buffer = self._buffers.get(buffer_key)
+        if buffer is not None:
+            return buffer
+        matches = [item for item in self._buffers.values() if item.chat_key == buffer_key]
+        return matches[0] if len(matches) == 1 else None
 
-    def has_pending(self, chat_key: str) -> bool:
-        buffer = self._buffers.get(chat_key)
+    def has_pending(self, buffer_key: str) -> bool:
+        buffer = self.get(buffer_key)
         return bool(buffer and buffer.messages)
 
-    def next_position(self, chat_key: str) -> tuple[int, int]:
-        buffer = self._buffers.get(chat_key)
+    def next_position(self, buffer_key: str) -> tuple[int, int]:
+        buffer = self._buffers.get(buffer_key)
         if buffer is None:
-            generation = self._generation_seed.get(chat_key, -1) + 1
+            generation = self._generation_seed.get(buffer_key, -1) + 1
             return generation, 0
         return buffer.generation, len(buffer.messages)
 
@@ -43,10 +47,12 @@ class BufferManager:
         first_seen_at: float,
         max_wait_deadline: float,
     ) -> ChatBuffer:
-        buffer = self._buffers.get(envelope.chat_key)
+        buffer = self._buffers.get(envelope.buffer_key)
         if buffer is None:
             buffer = ChatBuffer(
+                buffer_key=envelope.buffer_key,
                 chat_key=envelope.chat_key,
+                sender_bucket=envelope.sender_bucket,
                 generation=envelope.generation,
                 last_update=0.0,
                 timeout_at=timeout_at,
@@ -54,7 +60,7 @@ class BufferManager:
                 quiet_deadline=timeout_at,
                 max_wait_deadline=max_wait_deadline,
             )
-            self._buffers[envelope.chat_key] = buffer
+            self._buffers[envelope.buffer_key] = buffer
         if buffer.generation != envelope.generation:
             raise ValueError("消息 generation 与频道缓冲不一致")
         buffer.messages.append(envelope)
@@ -62,28 +68,31 @@ class BufferManager:
         buffer.timeout_at = timeout_at
         buffer.quiet_deadline = timeout_at
         buffer.max_wait_deadline = max_wait_deadline
-        self._generation_seed[envelope.chat_key] = max(
-            self._generation_seed.get(envelope.chat_key, -1),
+        self._generation_seed[envelope.buffer_key] = max(
+            self._generation_seed.get(envelope.buffer_key, -1),
             envelope.generation,
         )
         return buffer
 
-    def take(self, chat_key: str, generation: int) -> Optional[ChatBuffer]:
-        buffer = self._buffers.get(chat_key)
+    def take(self, buffer_key: str, generation: int) -> Optional[ChatBuffer]:
+        buffer = self._buffers.get(buffer_key)
         if buffer is None or buffer.generation != generation:
             return None
-        self._buffers.pop(chat_key, None)
-        self._generation_seed[chat_key] = max(self._generation_seed.get(chat_key, -1), generation)
+        self._buffers.pop(buffer_key, None)
+        self._generation_seed[buffer_key] = max(self._generation_seed.get(buffer_key, -1), generation)
         return buffer
 
-    def clear(self, chat_key: str, generation: int) -> Optional[ChatBuffer]:
-        return self.take(chat_key, generation)
+    def clear(self, buffer_key: str, generation: int) -> Optional[ChatBuffer]:
+        return self.take(buffer_key, generation)
 
     def restore(
         self,
         envelopes: Iterable[MessageEnvelope],
         timeout_at: float,
         *,
+        buffer_key: str,
+        chat_key: str,
+        sender_bucket: str,
         first_seen_at: float,
         max_wait_deadline: float,
         semantic_complete: bool | None = None,
@@ -98,15 +107,18 @@ class BufferManager:
     ) -> None:
         grouped: dict[tuple[str, int], list[MessageEnvelope]] = {}
         for envelope in envelopes:
-            grouped.setdefault((envelope.chat_key, envelope.generation), []).append(envelope)
-            self._generation_seed[envelope.chat_key] = max(
-                self._generation_seed.get(envelope.chat_key, -1),
+            grouped.setdefault((envelope.buffer_key, envelope.generation), []).append(envelope)
+            self._generation_seed[envelope.buffer_key] = max(
+                self._generation_seed.get(envelope.buffer_key, -1),
                 envelope.generation,
             )
-        for (chat_key, generation), items in grouped.items():
+        for (restored_buffer_key, generation), items in grouped.items():
             items.sort(key=lambda item: item.sequence)
+            first = items[0]
             buffer = ChatBuffer(
-                chat_key=chat_key,
+                buffer_key=restored_buffer_key or buffer_key,
+                chat_key=first.chat_key or chat_key,
+                sender_bucket=first.sender_bucket or sender_bucket,
                 generation=generation,
                 messages=items,
                 last_update=0.0,
@@ -124,7 +136,10 @@ class BufferManager:
                 selected_wait_seconds=selected_wait_seconds,
                 classifier_fallback=classifier_fallback,
             )
-            self._buffers[chat_key] = buffer
+            self._buffers[buffer.buffer_key] = buffer
+
+    def for_chat(self, chat_key: str) -> list[ChatBuffer]:
+        return [buffer for buffer in self._buffers.values() if buffer.chat_key == chat_key and buffer.messages]
 
     def snapshot(self) -> dict[str, ChatBuffer]:
         return dict(self._buffers)
