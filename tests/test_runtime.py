@@ -31,7 +31,9 @@ def test_config_uses_hybrid_defaults() -> None:
     assert config.send_threshold == 0.8
     assert config.high_confidence_threshold == 0.95
     assert config.timeout_seconds == 10
-    assert config.high_confidence_timeout_seconds == 2
+    assert config.high_confidence_timeout_seconds == 4
+    assert config.cadence_multiplier == 1.25
+    assert config.cadence_margin_seconds == 0.5
     assert config.max_wait_seconds == 60
     assert config.usage_scope == "both"
     assert config.cancel_on_new_message is True
@@ -49,6 +51,10 @@ def test_config_rejects_invalid_high_confidence_settings() -> None:
         DebounceConfig(send_threshold=0.9, high_confidence_threshold=0.8)
     with pytest.raises(ValueError, match="高置信度静默时间"):
         DebounceConfig(timeout_seconds=2, high_confidence_timeout_seconds=3)
+    with pytest.raises(ValueError):
+        DebounceConfig(cadence_multiplier=0.9)
+    with pytest.raises(ValueError):
+        DebounceConfig(cadence_margin_seconds=-0.1)
 
 
 def test_legacy_config_clamps_missing_short_window() -> None:
@@ -193,6 +199,70 @@ async def test_later_high_confidence_message_uses_short_window() -> None:
     assert buffer.semantic_state == SemanticState.COMPLETE_HIGH
     assert buffer.selected_wait_seconds == 2
     await runtime.stop()
+
+
+def test_high_confidence_wait_adapts_to_recent_message_cadence() -> None:
+    from nekro_plugin_debounce import plugin
+    from nekro_plugin_debounce.state import ChatBuffer, MessageEnvelope
+
+    runtime = DebounceRuntime(
+        plugin,
+        DebounceConfig(timeout_seconds=15, high_confidence_timeout_seconds=4, max_wait_seconds=60),
+    )
+    buffer = ChatBuffer(
+        chat_key="chat",
+        generation=1,
+        messages=[
+            MessageEnvelope(
+                event_id=f"cadence-{index}",
+                message_id=f"cadence-{index}",
+                chat_key="chat",
+                generation=1,
+                sequence=index,
+                text="part",
+                received_at=timestamp,
+            )
+            for index, timestamp in enumerate((28.0, 31.0, 33.0))
+        ],
+        semantic_state=SemanticState.COMPLETE_HIGH,
+    )
+
+    wait_seconds, status, cadence_interval = runtime._wait_seconds_for(buffer)
+
+    assert status == "semantic_complete_high_confidence_adaptive_wait"
+    assert cadence_interval == 3.0
+    assert wait_seconds == pytest.approx(4.25)
+
+
+def test_adaptive_high_confidence_wait_is_capped_by_normal_window() -> None:
+    from nekro_plugin_debounce import plugin
+    from nekro_plugin_debounce.state import ChatBuffer, MessageEnvelope
+
+    runtime = DebounceRuntime(
+        plugin,
+        DebounceConfig(timeout_seconds=5, high_confidence_timeout_seconds=4, max_wait_seconds=60),
+    )
+    buffer = ChatBuffer(
+        chat_key="chat",
+        generation=1,
+        messages=[
+            MessageEnvelope(
+                event_id=f"cap-{index}",
+                message_id=f"cap-{index}",
+                chat_key="chat",
+                generation=1,
+                sequence=index,
+                text="part",
+                received_at=timestamp,
+            )
+            for index, timestamp in enumerate((10.0, 20.0))
+        ],
+        semantic_state=SemanticState.COMPLETE_HIGH,
+    )
+
+    wait_seconds, _, _ = runtime._wait_seconds_for(buffer)
+
+    assert wait_seconds == 5
 
 
 @pytest.mark.asyncio
