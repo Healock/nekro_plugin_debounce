@@ -13,7 +13,7 @@ plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
     description="结合语义完整性和静默时间窗口合并连续消息。",
-    version="0.4.1",
+    version="0.4.2",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -49,10 +49,22 @@ class DebounceConfig(ConfigBase):
         description="最后一条消息后的静默观察时间。",
     )
     high_confidence_timeout_seconds: int = Field(
-        default=2,
+        default=4,
         ge=1,
         title="高置信度静默时间（秒）",
-        description="后续消息达到高置信度完整时使用的静默观察时间。",
+        description="后续消息达到高置信度完整时使用的最短静默观察时间。",
+    )
+    cadence_multiplier: float = Field(
+        default=1.25,
+        ge=1.0,
+        title="发送节奏等待倍率",
+        description="高置信度等待时，将近期消息间隔乘以该倍率估算静默时间。",
+    )
+    cadence_margin_seconds: float = Field(
+        default=0.5,
+        ge=0.0,
+        title="发送节奏额外等待（秒）",
+        description="在近期消息间隔估算值上增加的缓冲时间。",
     )
     max_wait_seconds: int = Field(
         default=60,
@@ -74,7 +86,7 @@ class DebounceConfig(ConfigBase):
     debug_logging: bool = Field(
         default=False,
         title="启用调试日志",
-        description="开启后记录完整性概率、阈值、等待状态和释放原因。",
+        description="开启后记录完整性概率、近期发送间隔、等待状态和释放原因。",
     )
 
     @model_validator(mode="after")

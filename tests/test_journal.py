@@ -19,7 +19,16 @@ def make_record(event_id: str = "m1") -> JournalRecord:
         last_message_id="m1",
         updated_at=time.time(),
         timeout_at=time.time() + 10,
+        received_at=123.5,
     )
+
+
+def test_journal_record_without_received_at_uses_legacy_default() -> None:
+    record = make_record().model_dump(exclude={"received_at"})
+
+    restored = JournalRecord.model_validate(record)
+
+    assert restored.received_at == 0.0
 
 
 class Store:
@@ -43,6 +52,7 @@ async def test_journal_round_trip_and_ack() -> None:
     assert not await journal.append(record)
     loaded = await JournalStore(backing).load()
     assert loaded[0].event_id == "m1"
+    assert loaded[0].received_at == 123.5
     await journal.mark_flushing(["m1"])
     assert (await journal.records())[0].state == JournalState.FLUSHING
     await journal.mark_manual_recovery(["m1"], "test")

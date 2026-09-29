@@ -45,6 +45,7 @@ class JournalRecord(BaseModel):
     adapter_key: str = ""
     platform_userid: str = ""
     raw_cq_code: str = ""
+    received_at: float = 0.0
     updated_at: float
     timeout_at: float
     first_seen_at: float = 0.0
@@ -90,6 +91,7 @@ class MessageEnvelope:
     adapter_key: str = ""
     platform_userid: str = ""
     raw_cq_code: str = ""
+    received_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -121,3 +123,8 @@ class ChatBuffer:
     @property
     def text(self) -> str:
         return " ".join(message.text.strip() for message in self.messages if message.text.strip())
+
+    @property
+    def recent_message_intervals(self) -> list[float]:
+        timestamps = [message.received_at for message in self.messages if message.received_at > 0]
+        return [later - earlier for earlier, later in zip(timestamps, timestamps[1:]) if later >= earlier]

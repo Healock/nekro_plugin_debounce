@@ -1,6 +1,6 @@
 # NekroAgent 消息防抖
 
-版本：`0.4.1`
+版本：`0.4.2`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
@@ -19,18 +19,24 @@
 | `send_threshold` | `0.8` | 完整概率阈值；值越高，越不容易判定为已说完。 |
 | `high_confidence_threshold` | `0.95` | 后续消息进入短静默窗口所需的高置信度阈值。 |
 | `timeout_seconds` | `10` | 最后一条消息后的静默观察时间，单位为秒；`0` 表示立即进入 timeout 判断 |
-| `high_confidence_timeout_seconds` | `2` | 后续累计文本达到高置信度完整时使用的短静默时间。 |
+| `high_confidence_timeout_seconds` | `4` | 后续累计文本达到高置信度完整时使用的最短静默时间。 |
+| `cadence_multiplier` | `1.25` | 发送节奏估算倍率。 |
+| `cadence_margin_seconds` | `0.5` | 发送节奏估算的额外缓冲时间，单位为秒。 |
 | `max_wait_seconds` | `60` | 从第一条消息开始计算的最大等待时间，单位为秒 |
 | `enabled` | `true` | 是否启用 |
 | `usage_scope` | `both` | `both`、`group`、`private` |
 | `cancel_on_new_message` | `true` | 字段保留；Nekro v0.4.0 不取消运行中的 Agent |
 | `debug_logging` | `false` | 开启后在日志中记录概率变化、阈值、等待窗口和释放原因 |
 
-每条文本消息都会基于当前频道的累计文本重新分类。第一条消息始终使用普通静默窗口；后续消息只有在达到 `high_confidence_threshold` 时才使用较短的静默窗口，其余情况使用普通窗口。静默结束时会重新分类，概率下降时会恢复普通等待，直到语义完整或达到 `max_wait_seconds` 后强制触发。模型加载或推理失败时，当前批次退化为普通时间防抖。
+每条文本消息都会基于当前频道的累计文本重新分类。第一条消息始终使用普通静默窗口；后续消息只有在达到 `high_confidence_threshold` 时才进入高置信度等待，其余情况使用普通窗口。高置信度等待会参考本批最近最多 3 个消息间隔，按 `max(high_confidence_timeout_seconds, 最大近期间隔 × cadence_multiplier + cadence_margin_seconds)` 计算，并且不超过普通静默窗口和最大等待期限。缺少可用时间记录时使用配置的最短高置信度等待。静默结束时会重新分类，概率下降时恢复普通等待，直到语义完整或达到 `max_wait_seconds` 后强制触发。模型加载或推理失败时，当前批次退化为普通时间防抖。
+
+插件升级不会覆盖已保存的配置。旧安装如果仍将 `high_confidence_timeout_seconds` 设为 `2`，该值继续作为自适应等待的最短值；需要采用新的默认下限时，请在插件配置中改为 `4` 秒。
+
+例如最近两条消息间隔为 3 秒和 2 秒时，高置信度等待为 `max(4, 3 × 1.25 + 0.5) = 4.25` 秒。这样语义完整仍能缩短等待，但如果用户习惯在几秒间隔内连续补充，短窗口会相应延长。调试日志会记录所用近期间隔、倍率、额外缓冲和最终等待秒数，不包含完整消息文本。
 
 累计文本的概率不是单调递增的进度值。新增内容可能引入新的未完成语义，因此插件始终使用最新一次分类结果，不保留历史最高概率。例如概率从 `0.9` 降到 `0.5` 时，当前状态会随之回退。
 
-`high_confidence_threshold` 和模型输出的 softmax 概率没有经过可靠性校准。`0.95` 是进入短等待的工程阈值，不代表模型实际有 95% 的正确率；启用 `debug_logging` 后，应结合真实服务器日志观察概率分布和误拆分情况。
+`high_confidence_threshold` 和模型输出的 softmax 概率没有经过可靠性校准。`0.95` 是进入自适应短等待的工程阈值，不代表模型实际有 95% 的正确率；语义概率只判断文本完整性，发送节奏单独影响等待时间。启用 `debug_logging` 后，应结合真实服务器日志观察概率分布和误拆分情况。
 
 旧配置中的 `debounce_mode` 已废弃。插件不再在时间模式和语义模式之间二选一；残留字段不会阻止配置加载，也不参与运行逻辑。
 
@@ -64,8 +70,8 @@ ONNX Runtime、Transformers、NumPy 和 ModelScope 在插件初始化阶段开�
 
 ## Nekro API 差异
 
-Nekro v0.4.1 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息伪造、运行中 Agent 取消、旧回复丢弃和媒体消息重放。超时重放仅用于恢复本插件自己阻塞的文本批次；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。
+Nekro v0.4.2 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息伪造、运行中 Agent 取消、旧回复丢弃和媒体消息重放。超时重放仅用于恢复本插件自己阻塞的文本批次；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。
 
 ## 验证边界
 
-本仓库包含混合状态机、分级等待、概率回退、分类器数学适配、journal 序列化/恢复/幂等、timeout 和媒体边界测试。未运行 Docker、真实 Nekro、OneBot、ONNX 推理或模型下载，因此不能据此声称插件已在真实部署中加载或运行通过。
+本仓库包含混合状态机、分级及自适应等待、概率回退、分类器数学适配、journal 序列化/恢复/幂等、timeout 和媒体边界测试。未运行 Docker、真实 Nekro、OneBot、ONNX 推理或模型下载，因此不能据此声称插件已在真实部署中加载或运行通过。

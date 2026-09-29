@@ -111,6 +111,7 @@ class DebounceRuntime:
                     adapter_key=record.adapter_key,
                     platform_userid=record.platform_userid,
                     raw_cq_code=record.raw_cq_code,
+                    received_at=record.received_at,
                 )
                 for record in batch
             ]
@@ -298,6 +299,7 @@ class DebounceRuntime:
             adapter_key=str(getattr(message, "adapter_key", "") or ""),
             platform_userid=str(getattr(message, "platform_userid", "") or ""),
             raw_cq_code=str(getattr(message, "raw_cq_code", "") or ""),
+            received_at=now,
             updated_at=now,
             timeout_at=quiet_deadline,
             first_seen_at=first_seen_at,
@@ -333,6 +335,7 @@ class DebounceRuntime:
             adapter_key=record.adapter_key,
             platform_userid=record.platform_userid,
             raw_cq_code=record.raw_cq_code,
+            received_at=record.received_at,
         )
         try:
             buffer = self.buffers.add(
@@ -479,18 +482,32 @@ class DebounceRuntime:
     def _format_probability(probability: float | None) -> str:
         return "none" if probability is None else f"{probability:.4f}"
 
-    def _wait_seconds_for(self, buffer: ChatBuffer) -> tuple[float, str]:
+    def _wait_seconds_for(self, buffer: ChatBuffer) -> tuple[float, str, float | None]:
         if len(buffer.messages) > 1 and buffer.semantic_state == SemanticState.COMPLETE_HIGH:
-            return self.high_confidence_quiet_seconds, "semantic_complete_high_confidence_short_wait"
+            recent_intervals = buffer.recent_message_intervals[-3:]
+            cadence_interval = max(recent_intervals, default=0.0)
+            cadence_wait = (
+                cadence_interval * float(self.config.cadence_multiplier)
+                + float(self.config.cadence_margin_seconds)
+                if cadence_interval > 0
+                else 0.0
+            )
+            wait_seconds = max(self.high_confidence_quiet_seconds, cadence_wait)
+            return (
+                min(wait_seconds, self.quiet_seconds),
+                "semantic_complete_high_confidence_adaptive_wait",
+                cadence_interval or None,
+            )
         if buffer.semantic_state == SemanticState.INCOMPLETE:
-            return self.quiet_seconds, "semantic_incomplete_wait"
-        return self.quiet_seconds, "semantic_complete_normal_wait"
+            return self.quiet_seconds, "semantic_incomplete_wait", None
+        return self.quiet_seconds, "semantic_complete_normal_wait", None
 
     async def _apply_wait_policy(self, buffer: ChatBuffer) -> bool:
-        wait_seconds, status = self._wait_seconds_for(buffer)
+        wait_seconds, status, cadence_interval = self._wait_seconds_for(buffer)
         now = time.time()
         deadline = min(now + wait_seconds, buffer.max_wait_deadline)
-        buffer.selected_wait_seconds = wait_seconds
+        selected_wait_seconds = max(0.0, deadline - now)
+        buffer.selected_wait_seconds = selected_wait_seconds
         buffer.quiet_deadline = deadline
         buffer.timeout_at = deadline
         try:
@@ -498,7 +515,7 @@ class DebounceRuntime:
                 buffer.record_ids,
                 timeout_at=deadline,
                 quiet_deadline=deadline,
-                selected_wait_seconds=wait_seconds,
+                selected_wait_seconds=selected_wait_seconds,
             )
         except JournalError as exc:
             self.logger.exception(f"[Debounce] 保存等待窗口失败，当前消息放行: {exc}")
@@ -515,7 +532,11 @@ class DebounceRuntime:
             self.logger.exception(f"[Debounce] 更新 timeout 任务失败，保留 journal 等待恢复: {exc}")
         if self.config.debug_logging:
             self.logger.info(
-                f"[Debounce] status={status} selected_wait_seconds={wait_seconds:.1f} "
+                f"[Debounce] status={status} cadence_interval_seconds="
+                f"{cadence_interval if cadence_interval is not None else 'none'} "
+                f"cadence_multiplier={float(self.config.cadence_multiplier):.2f} "
+                f"cadence_margin_seconds={float(self.config.cadence_margin_seconds):.1f} "
+                f"selected_wait_seconds={selected_wait_seconds:.1f} "
                 f"elapsed={max(0.0, now - buffer.first_seen_at):.1f}s",
             )
         return True
