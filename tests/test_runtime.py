@@ -119,6 +119,52 @@ async def test_each_message_reclassifies_accumulated_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_messages_from_different_senders_use_separate_buffers() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(
+        plugin,
+        DebounceConfig(timeout_seconds=1, high_confidence_timeout_seconds=1, max_wait_seconds=5),
+    )
+    runtime.classifier.classify = lambda *_args: _result(True)  # type: ignore[method-assign]
+    replayed: list[tuple[str, str]] = []
+
+    async def capture(buffer) -> None:
+        replayed.append((buffer.sender_bucket, buffer.text))
+
+    runtime._replay_as_human_message = capture  # type: ignore[method-assign]
+    first = Message(
+        chat_key="group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="a-1",
+        content_text="用户 A 的消息",
+        content_data=[{"type": "text", "text": "用户 A 的消息"}],
+    )
+    second = Message(
+        chat_key="group",
+        chat_type="group",
+        sender_id="user-b",
+        message_id="b-1",
+        content_text="用户 B 的消息",
+        content_data=[{"type": "text", "text": "用户 B 的消息"}],
+    )
+
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_ALL"
+    assert len(runtime.buffers.for_chat("group")) == 2
+
+    for buffer in runtime.buffers.for_chat("group"):
+        buffer.quiet_deadline = time.time() - 1
+        buffer.timeout_at = buffer.quiet_deadline
+        await runtime._on_timeout(buffer.buffer_key, buffer.generation)
+
+    assert sorted(replayed) == [("user-a", "用户 A 的消息"), ("user-b", "用户 B 的消息")]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_new_message_resets_quiet_deadline_only() -> None:
     from nekro_plugin_debounce import plugin
 
