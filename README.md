@@ -68,6 +68,12 @@ ONNX Runtime、Transformers、NumPy 和 ModelScope 在插件初始化阶段开�
 
 频道执行 `/reset` 时，插件会取消该频道尚未释放的防抖批次，避免重置后旧消息延迟触发。
 
+每个延迟释放和媒体边界都在频道锁内重新读取 `DBChatChannel`。频道 inactive
+或 observe 时，批次会写入 `canceled` journal 状态并清理缓冲和 timeout；频道恢复
+不会自动重放这批旧消息。其他插件可以按需调用
+`nekro_plugin_debounce.invalidate_channel(chat_key, reason)`，该入口是幂等的，
+不会让调度器对防抖插件形成硬依赖。
+
 ## Nekro API 差异
 
 Nekro v0.4.2 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息伪造、运行中 Agent 取消、旧回复丢弃和媒体消息重放。超时重放仅用于恢复本插件自己阻塞的文本批次；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。

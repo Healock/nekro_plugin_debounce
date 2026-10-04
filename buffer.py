@@ -17,6 +17,9 @@ class BufferManager:
         self._buffers: dict[str, ChatBuffer] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._generation_seed: dict[str, int] = {}
+        # 频道级失效水位覆盖 sender bucket，避免失效后的旧 generation 被新
+        # 消息复用。水位只单调增加，重复 invalidate 不会继续跳号。
+        self._channel_generation_floor: dict[str, int] = {}
 
     def lock_for(self, chat_key: str) -> asyncio.Lock:
         return self._locks.setdefault(chat_key, asyncio.Lock())
@@ -32,12 +35,33 @@ class BufferManager:
         buffer = self.get(buffer_key)
         return bool(buffer and buffer.messages)
 
-    def next_position(self, buffer_key: str) -> tuple[int, int]:
+    def next_position(self, buffer_key: str, chat_key: str | None = None) -> tuple[int, int]:
         buffer = self._buffers.get(buffer_key)
         if buffer is None:
-            generation = self._generation_seed.get(buffer_key, -1) + 1
+            seed = self._generation_seed.get(buffer_key, -1)
+            if chat_key:
+                seed = max(seed, self._channel_generation_floor.get(chat_key, -1))
+            generation = seed + 1
             return generation, 0
         return buffer.generation, len(buffer.messages)
+
+    def invalidate_chat(self, chat_key: str, generations: Iterable[int] = ()) -> bool:
+        """推进频道 generation 水位，返回是否产生了新的失效状态。"""
+
+        candidates = [buffer.generation for buffer in self.for_chat(chat_key)]
+        candidates.extend(int(generation) for generation in generations)
+        if not candidates:
+            return False
+        previous = self._channel_generation_floor.get(chat_key, -1)
+        floor = max(previous, max(candidates))
+        changed = floor > previous
+        self._channel_generation_floor[chat_key] = floor
+        for buffer in self.for_chat(chat_key):
+            self._generation_seed[buffer.buffer_key] = max(
+                self._generation_seed.get(buffer.buffer_key, -1),
+                floor,
+            )
+        return changed
 
     def add(
         self,
