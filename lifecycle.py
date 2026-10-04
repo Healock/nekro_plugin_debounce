@@ -277,7 +277,7 @@ class DebounceRuntime:
         sender_key = sender_bucket(message)
         now = time.time()
         if current_buffer is None or not current_buffer.messages:
-            generation, sequence = self.buffers.next_position(internal_key)
+            generation, sequence = self.buffers.next_position(internal_key, chat_key)
             first_seen_at = now
             max_wait_deadline = now + float(self.config.max_wait_seconds)
             classifier_fallback = False
@@ -564,26 +564,141 @@ class DebounceRuntime:
     def _debug_chat_key(self, chat_key: str) -> str:
         return f"{chat_key[:4]}...{chat_key[-4:]}" if len(chat_key) > 8 else chat_key
 
+    async def _get_release_channel(self, chat_key: str) -> Any:
+        """通过 Nekro 公共模型 API 读取释放前的频道状态。"""
+
+        from nekro_agent.models.db_chat_channel import DBChatChannel
+
+        return await DBChatChannel.get_channel(chat_key=chat_key)
+
+    async def invalidate_channel(self, chat_key: str, reason: str = "external_invalidate") -> bool:
+        """取消频道内尚未释放的批次并推进 generation 水位。
+
+        该入口供 schedule 等可选协作插件调用。调用失败不会被吞掉，
+        由调用方决定是否继续切换频道状态；release gate 仍会重新读取
+        DBChatChannel，因此缺少调用方或发生 TOCTOU 时也会 fail-closed。
+        """
+
+        chat_key = str(chat_key or "")
+        if not chat_key:
+            return False
+        lock = self.buffers.lock_for(chat_key)
+        async with lock:
+            buffers = self.buffers.for_chat(chat_key)
+            records = await self.journal.records_for(chat_key)
+            active_records = [
+                record
+                for record in records
+                if record.state not in {JournalState.CANCELED, JournalState.ACKED}
+            ]
+            if not buffers and not active_records:
+                return False
+
+            record_ids: list[str] = []
+            for record in active_records:
+                if record.event_id not in record_ids:
+                    record_ids.append(record.event_id)
+            for buffer in buffers:
+                for record_id in buffer.record_ids:
+                    if record_id not in record_ids:
+                        record_ids.append(record_id)
+            try:
+                await self.journal.cancel(record_ids, reason)
+            except JournalError:
+                self.logger.exception(
+                    f"[Debounce] 频道失效无法持久化取消状态，保留 pending: chat={chat_key} reason={reason}",
+                )
+                raise
+
+            generations = [record.generation for record in active_records]
+            generations.extend(buffer.generation for buffer in buffers)
+            for buffer in buffers:
+                self.tasks.cancel(buffer.buffer_key, buffer.generation)
+                self.buffers.clear(buffer.buffer_key, buffer.generation)
+            self.buffers.invalidate_chat(chat_key, generations)
+            self.logger.info(
+                f"[Debounce] 频道批次已失效: chat={self._debug_chat_key(chat_key)} "
+                f"batches={len(buffers)} records={len(record_ids)} reason={reason}",
+            )
+            return True
+
+    async def _release_gate(self, buffer: ChatBuffer, reason: str) -> ChatBuffer | None:
+        """在频道锁内完成状态、generation 和 journal pending 校验。
+
+        返回被 take 的缓冲表示允许释放；返回 None 表示重复释放、旧
+        generation、持久化状态异常或频道已进入 observe/inactive。所有
+        延迟路径和媒体边界都必须经过此 gate。
+        """
+
+        current = self.buffers.get(buffer.buffer_key)
+        if current is None or current.generation != buffer.generation or not current.messages:
+            return None
+        record_ids = current.record_ids
+        records = await self.journal.records_for(current.chat_key, current.generation)
+        batch_records = [
+            record
+            for record in records
+            if (record.sender_bucket or record.sender_id or "unknown") == (current.sender_bucket or "unknown")
+        ]
+        states = {record.event_id: record.state for record in batch_records}
+        if set(states) != set(record_ids) or any(states.get(record_id) != JournalState.PENDING for record_id in record_ids):
+            return None
+
+        try:
+            channel = await self._get_release_channel(current.chat_key)
+        except Exception as exc:
+            self.logger.warning(
+                f"[Debounce] release gate 无法读取频道状态，保留 pending: "
+                f"chat={self._debug_chat_key(current.chat_key)}: {exc}",
+            )
+            return None
+        if channel is None:
+            self.logger.warning(
+                f"[Debounce] release gate 未找到频道，保留 pending: chat={self._debug_chat_key(current.chat_key)}",
+            )
+            return None
+        if not bool(getattr(channel, "is_active", False)) or bool(getattr(channel, "observe_mode", False)):
+            try:
+                await self.journal.cancel(record_ids, f"{reason}:channel_inactive_or_observe")
+            except JournalError:
+                self.logger.exception(
+                    f"[Debounce] 频道 inactive/observe 时取消 journal 失败，保留 pending: "
+                    f"chat={self._debug_chat_key(current.chat_key)}",
+                )
+                raise
+            self.tasks.cancel(current.buffer_key, current.generation)
+            self.buffers.clear(current.buffer_key, current.generation)
+            self.buffers.invalidate_chat(current.chat_key, [current.generation])
+            self.logger.info(
+                f"[Debounce] release gate 丢弃频道批次: chat={self._debug_chat_key(current.chat_key)} "
+                f"generation={current.generation} reason={reason}",
+            )
+            return None
+
+        await self.journal.update_batch(record_ids, release_reason=reason)
+        await self.journal.mark_flushing(record_ids)
+        taken = self.buffers.take(current.buffer_key, current.generation)
+        return taken
+
     async def _merge_and_trigger(self, message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
         try:
-            merge_into_message(message, buffer.messages)
+            released = await self._release_gate(buffer, reason)
+        except JournalError as exc:
+            self.logger.exception(f"[Debounce] 媒体边界 release gate 持久化失败，当前消息放行: {exc}")
+            return MsgSignal.CONTINUE
+        if released is None:
+            return MsgSignal.CONTINUE
+        try:
+            merge_into_message(message, released.messages)
         except Exception as exc:
             self.logger.exception(f"[Debounce] 消息合并失败，当前消息 fail-open，pending 保留: {exc}")
             try:
-                await self.journal.mark_manual_recovery(buffer.record_ids, f"merge_failed:{reason}")
-                self.buffers.clear(buffer.buffer_key, buffer.generation)
-                self.tasks.cancel(buffer.buffer_key, buffer.generation)
+                await self.journal.mark_manual_recovery(released.record_ids, f"merge_failed:{reason}")
             except JournalError as journal_exc:
                 self.logger.exception(f"[Debounce] 合并失败批次无法标记人工恢复: {journal_exc}")
             return MsgSignal.CONTINUE
         try:
-            await self.journal.update_batch(buffer.record_ids, release_reason=reason)
-        except JournalError as exc:
-            self.logger.exception(f"[Debounce] 保存释放原因失败: {exc}")
-        self.buffers.clear(buffer.buffer_key, buffer.generation)
-        self.tasks.cancel(buffer.buffer_key, buffer.generation)
-        try:
-            await self.journal.mark_manual_recovery(buffer.record_ids, f"outer_persist_unconfirmed:{reason}")
+            await self.journal.mark_manual_recovery(released.record_ids, f"outer_persist_unconfirmed:{reason}")
         except JournalError as exc:
             self.logger.exception(f"[Debounce] 合并后更新 journal 失败，保留原记录: {exc}")
         if self.config.debug_logging:
@@ -641,32 +756,26 @@ class DebounceRuntime:
             await self._flush_after_timeout(buffer, reason or "timeout")
 
     async def _flush_after_timeout(self, buffer: ChatBuffer, reason: str) -> None:
-        record_ids = buffer.record_ids
         try:
-            await self.journal.update_batch(record_ids, release_reason=reason)
-        except JournalError as exc:
-            self.logger.exception(f"[Debounce] 保存 timeout 释放原因失败: {exc}")
-        try:
-            await self.journal.mark_flushing(record_ids)
+            taken = await self._release_gate(buffer, reason)
         except JournalError as exc:
             key = (buffer.buffer_key, buffer.generation)
             failures = self._timeout_state_failures.get(key, 0) + 1
             self._timeout_state_failures[key] = failures
-            self.logger.exception(f"[Debounce] timeout 状态写入失败，第 {failures} 次: {exc}")
+            self.logger.exception(f"[Debounce] timeout release gate 状态写入失败，第 {failures} 次: {exc}")
             if failures <= MAX_TIMEOUT_STATE_RETRIES:
                 retry_at = time.time() + TIMEOUT_RETRY_DELAY_SECONDS * failures
                 self.tasks.schedule(buffer.buffer_key, buffer.generation, retry_at)
             else:
                 try:
-                    await self.journal.mark_manual_recovery(record_ids, "timeout_state_write_exhausted")
+                    await self.journal.mark_manual_recovery(buffer.record_ids, "timeout_state_write_exhausted")
                     self.buffers.clear(buffer.buffer_key, buffer.generation)
                 except JournalError as journal_exc:
                     self.logger.exception(f"[Debounce] timeout 达到重试上限且无法标记人工恢复: {journal_exc}")
             return
-
-        taken = self.buffers.take(buffer.buffer_key, buffer.generation)
         if taken is None:
             return
+        record_ids = taken.record_ids
         try:
             await self._replay_as_human_message(taken)
         except Exception as exc:
@@ -687,11 +796,10 @@ class DebounceRuntime:
     async def _replay_as_human_message(self, buffer: ChatBuffer) -> None:
         """将超时缓冲重新交给用户消息入口，避免生成 SYSTEM 消息。"""
 
-        from nekro_agent.models.db_chat_channel import DBChatChannel
         from nekro_agent.schemas.chat_message import ChatMessage, ChatType
         from nekro_agent.services.message_service import message_service
 
-        channel = await DBChatChannel.get_channel(chat_key=buffer.chat_key)
+        channel = await self._get_release_channel(buffer.chat_key)
         last_message = buffer.messages[-1]
         content_text, content_data = merge_message_content(
             [(item.text, item.content_data) for item in buffer.messages],

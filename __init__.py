@@ -111,4 +111,10 @@ runtime = DebounceRuntime(plugin, config)
 register_matcher(plugin, runtime)
 register_lifecycle(plugin, runtime)
 
-__all__ = ["DebounceConfig", "config", "plugin", "runtime"]
+
+async def invalidate_channel(chat_key: str, reason: str = "external_invalidate") -> bool:
+    """可选地取消频道 pending 防抖批次，供其他插件在切换状态前调用。"""
+
+    return await runtime.invalidate_channel(chat_key, reason)
+
+__all__ = ["DebounceConfig", "config", "invalidate_channel", "plugin", "runtime"]

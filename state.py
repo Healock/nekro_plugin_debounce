@@ -15,6 +15,7 @@ class JournalState(StrEnum):
     PENDING = "pending"
     FLUSHING = "flushing"
     MANUAL_RECOVERY = "manual_recovery"
+    CANCELED = "canceled"
     ACKED = "acked"
 
 

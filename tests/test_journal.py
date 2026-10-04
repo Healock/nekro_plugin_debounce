@@ -72,6 +72,21 @@ async def test_journal_restores_pending_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_is_durable_and_idempotent() -> None:
+    backing = Store()
+    journal = JournalStore(backing)
+    await journal.append(make_record())
+
+    await journal.cancel(["m1"], "schedule_observe")
+    await journal.cancel(["m1"], "schedule_observe")
+
+    records = await JournalStore(backing).load()
+    assert len(records) == 1
+    assert records[0].state == JournalState.CANCELED
+    assert records[0].release_reason == "schedule_observe"
+
+
+@pytest.mark.asyncio
 async def test_discard_leaves_safe_ack_tombstone_when_cleanup_save_fails() -> None:
     class CleanupFailStore(Store):
         def __init__(self) -> None:

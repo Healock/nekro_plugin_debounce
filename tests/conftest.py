@@ -5,6 +5,8 @@ import tempfile
 import types
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
+from enum import Enum
 
 from pydantic import BaseModel
 
@@ -99,6 +101,61 @@ def pytest_configure() -> None:
         BLOCK_ALL = 2
 
     signal.MsgSignal = MsgSignal
+    models = types.ModuleType("nekro_agent.models")
+    models.__path__ = []  # type: ignore[attr-defined]
+    db_chat_channel = types.ModuleType("nekro_agent.models.db_chat_channel")
+
+    @dataclass
+    class _Channel:
+        chat_key: str
+        is_active: bool = True
+        observe_mode: bool = False
+        adapter_key: str = "test"
+        chat_type: str = "private"
+
+    class DBChatChannel:
+        channels: dict[str, _Channel] = {}
+
+        @classmethod
+        async def get_channel(cls, *, chat_key: str) -> _Channel:
+            return cls.channels.setdefault(chat_key, _Channel(chat_key=chat_key))
+
+    db_chat_channel.DBChatChannel = DBChatChannel
+    chat_message = types.ModuleType("nekro_agent.schemas.chat_message")
+
+    class ChatType(str, Enum):
+        PRIVATE = "private"
+        GROUP = "group"
+
+    @dataclass
+    class ChatMessage:
+        message_id: str
+        sender_id: str
+        sender_name: str
+        sender_nickname: str
+        adapter_key: str
+        platform_userid: str
+        is_tome: int
+        is_recalled: bool
+        chat_key: str
+        chat_type: ChatType
+        content_text: str
+        content_data: list[Any]
+        raw_cq_code: str
+        ext_data: dict[str, Any]
+        send_timestamp: int
+
+    chat_message.ChatMessage = ChatMessage
+    chat_message.ChatType = ChatType
+    services = types.ModuleType("nekro_agent.services")
+    services.__path__ = []  # type: ignore[attr-defined]
+    message_service_module = types.ModuleType("nekro_agent.services.message_service")
+
+    class _MessageService:
+        async def push_human_message(self, **_kwargs: Any) -> None:
+            return None
+
+    message_service_module.message_service = _MessageService()
     sys.modules.update(
         {
             "nekro_agent": root,
@@ -106,5 +163,10 @@ def pytest_configure() -> None:
             "nekro_agent.api.plugin": plugin_api,
             "nekro_agent.schemas": schemas,
             "nekro_agent.schemas.signal": signal,
+            "nekro_agent.models": models,
+            "nekro_agent.models.db_chat_channel": db_chat_channel,
+            "nekro_agent.schemas.chat_message": chat_message,
+            "nekro_agent.services": services,
+            "nekro_agent.services.message_service": message_service_module,
         },
     )

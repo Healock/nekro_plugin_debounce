@@ -116,6 +116,35 @@ class JournalStore:
     async def mark_flushing(self, event_ids: Iterable[str]) -> None:
         await self.transition(event_ids, JournalState.FLUSHING)
 
+    async def cancel(self, event_ids: Iterable[str], reason: str) -> None:
+        """持久化取消状态，供频道失效后阻止旧批次恢复或重放。
+
+        取消操作是幂等的。记录保留在 journal 中作为 durable tombstone，
+        因此频道恢复或进程重启时不会把旧批次当作 pending 再次调度。
+        """
+
+        await self._ensure_loaded()
+        ids = list(event_ids)
+        async with self._lock:
+            previous: dict[str, JournalRecord] = {
+                event_id: record.model_copy(deep=True)
+                for event_id in ids
+                if (record := self._records.get(event_id)) is not None
+            }
+            for event_id in ids:
+                record = self._records.get(event_id)
+                if record is None or record.state in {JournalState.CANCELED, JournalState.ACKED}:
+                    continue
+                record.state = JournalState.CANCELED
+                record.release_reason = reason
+                record.error_state = ""
+                record.updated_at = time.time()
+            try:
+                await self._save_locked()
+            except Exception:
+                self._records.update(previous)
+                raise
+
     async def update_batch(self, event_ids: Iterable[str], **updates: object) -> None:
         """原子更新同一缓冲批次的截止时间和语义状态。"""
 
