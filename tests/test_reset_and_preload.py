@@ -8,6 +8,7 @@ import pytest
 from nekro_plugin_debounce import DebounceConfig, plugin
 from nekro_plugin_debounce.journal import JournalError, JournalStore
 from nekro_plugin_debounce.lifecycle import DebounceRuntime
+from nekro_plugin_debounce.state import JournalRecord, JournalState
 
 
 @dataclass
@@ -94,6 +95,76 @@ async def test_reset_persist_failure_marks_batch_for_manual_recovery() -> None:
     assert len(records) == 1
     assert records[0].state.value == "manual_recovery"
     assert not runtime.buffers.has_pending("chat")
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_reset_skips_generation_used_by_older_manual_recovery_record() -> None:
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(
+        plugin,
+        DebounceConfig(timeout_seconds=30, high_confidence_timeout_seconds=2, max_wait_seconds=60),
+    )
+
+    async def classify(*_args):
+        from nekro_plugin_debounce.classifier import ClassificationResult
+
+        return ClassificationResult(probability=0.1, complete=False)
+
+    runtime.classifier.classify = classify  # type: ignore[method-assign]
+    await runtime.handle_user_message(None, Message(message_id="before-reset"))
+    old_buffer = runtime.buffers.get("chat")
+    assert old_buffer is not None
+
+    await runtime.journal.append(
+        JournalRecord(
+            event_id="legacy-manual-recovery",
+            chat_key="chat",
+            generation=old_buffer.generation + 1,
+            sequence=0,
+            state=JournalState.MANUAL_RECOVERY,
+            sender_id="u1",
+            text="legacy",
+            updated_at=1.0,
+            timeout_at=1.0,
+        ),
+    )
+
+    await runtime.reset_channel(Context())
+    second = Message(message_id="after-reset", content_text="new", content_data=[{"type": "text", "text": "new"}])
+    await runtime.handle_user_message(None, second)
+    new_buffer = runtime.buffers.get("chat")
+    assert new_buffer is not None
+    assert new_buffer.generation > old_buffer.generation + 1
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_reset_without_pending_buffer_still_advances_journal_generation() -> None:
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(
+        plugin,
+        DebounceConfig(timeout_seconds=30, high_confidence_timeout_seconds=2, max_wait_seconds=60),
+    )
+    await runtime.journal.append(
+        JournalRecord(
+            event_id="legacy-manual-recovery",
+            chat_key="chat",
+            generation=7,
+            sequence=0,
+            state=JournalState.MANUAL_RECOVERY,
+            sender_id="u1",
+            text="legacy",
+            updated_at=1.0,
+            timeout_at=1.0,
+        ),
+    )
+
+    await runtime.reset_channel(Context())
+    await runtime.handle_user_message(None, Message(message_id="after-reset"))
+    new_buffer = runtime.buffers.get("chat")
+    assert new_buffer is not None
+    assert new_buffer.generation == 8
     await runtime.stop()
 
 
