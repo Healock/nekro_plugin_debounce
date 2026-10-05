@@ -10,7 +10,7 @@ from nekro_agent.services.message_service import message_service
 
 from nekro_plugin_debounce import DebounceConfig
 from nekro_plugin_debounce.lifecycle import DebounceRuntime
-from nekro_plugin_debounce.state import ChatBuffer, JournalState, MessageEnvelope
+from nekro_plugin_debounce.state import ChatBuffer, JournalRecord, JournalState, MessageEnvelope
 
 
 @dataclass
@@ -154,6 +154,33 @@ async def test_duplicate_release_and_generation_or_journal_gate_are_safe() -> No
     second = await _pending(runtime, "gate-canceled")
     await runtime.journal.cancel(second.record_ids, "test_generation_gate")
     await runtime._on_timeout(second.buffer_key, second.generation)
+    assert replayed == ["pending"]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_release_gate_ignores_legacy_record_with_same_generation() -> None:
+    runtime, _channel_obj = await _ready_runtime()
+    replayed: list[str] = []
+    runtime._replay_as_human_message = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
+    buffer = await _pending(runtime, "current")
+
+    await runtime.journal.append(
+        JournalRecord(
+            event_id="legacy-same-generation",
+            chat_key=buffer.chat_key,
+            generation=buffer.generation,
+            sequence=0,
+            state=JournalState.MANUAL_RECOVERY,
+            sender_id="u1",
+            text="legacy",
+            updated_at=1.0,
+            timeout_at=1.0,
+        ),
+    )
+
+    await runtime._on_timeout(buffer.buffer_key, buffer.generation)
+
     assert replayed == ["pending"]
     await runtime.stop()
 

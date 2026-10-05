@@ -183,7 +183,16 @@ class DebounceRuntime:
             return
         async with self.buffers.lock_for(chat_key):
             buffers = self.buffers.for_chat(chat_key)
+            generations = [buffer.generation for buffer in buffers]
+            try:
+                generations.extend(record.generation for record in await self.journal.records_for(chat_key))
+            except JournalError as exc:
+                self.logger.warning(
+                    f"[Debounce] reset 读取历史 generation 失败，使用内存批次水位: "
+                    f"chat={self._debug_chat_key(chat_key)}: {exc}",
+                )
             if not buffers:
+                self.buffers.invalidate_chat(chat_key, generations)
                 return
             count = sum(len(buffer.messages) for buffer in buffers)
             for buffer in buffers:
@@ -209,6 +218,8 @@ class DebounceRuntime:
                         )
                 self.tasks.cancel(buffer.buffer_key, buffer.generation)
                 self.buffers.clear(buffer.buffer_key, buffer.generation)
+            # reset 后推进频道水位，避免新批次复用已取消批次的 generation。
+            self.buffers.invalidate_chat(chat_key, generations)
             self.logger.info(
                 f"[Debounce] reset 已取消 pending 批次: chat={chat_key} messages={count} "
                 f"batches={len(buffers)}",
@@ -635,13 +646,21 @@ class DebounceRuntime:
             return None
         record_ids = current.record_ids
         records = await self.journal.records_for(current.chat_key, current.generation)
-        batch_records = [
-            record
-            for record in records
-            if (record.sender_bucket or record.sender_id or "unknown") == (current.sender_bucket or "unknown")
+        records_by_id = {record.event_id: record for record in records}
+        missing_ids = [record_id for record_id in record_ids if record_id not in records_by_id]
+        non_pending_ids = [
+            record_id
+            for record_id in record_ids
+            if record_id in records_by_id and records_by_id[record_id].state != JournalState.PENDING
         ]
-        states = {record.event_id: record.state for record in batch_records}
-        if set(states) != set(record_ids) or any(states.get(record_id) != JournalState.PENDING for record_id in record_ids):
+        if missing_ids or non_pending_ids:
+            self.logger.warning(
+                f"[Debounce] release gate journal 不匹配，保留 pending: "
+                f"chat={self._debug_chat_key(current.chat_key)} generation={current.generation} "
+                f"sender={current.sender_bucket or 'unknown'} missing={len(missing_ids)} "
+                f"non_pending={len(non_pending_ids)} expected={len(record_ids)} "
+                f"actual={len(records_by_id)}",
+            )
             return None
 
         try:
