@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Any
 
@@ -238,6 +239,10 @@ class DebounceRuntime:
         lock = self.buffers.lock_for(chat_key)
         async with lock:
             current_buffer = self.buffers.get(internal_key)
+            asyncio.create_task(
+                self._observe_trigger_scope(_ctx, message, current_buffer),
+                name="debounce-trigger-scope-observation",
+            )
             if has_hard_boundary(message):
                 if current_buffer is None or not current_buffer.messages:
                     return MsgSignal.CONTINUE
@@ -574,6 +579,58 @@ class DebounceRuntime:
 
     def _debug_chat_key(self, chat_key: str) -> str:
         return f"{chat_key[:4]}...{chat_key[-4:]}" if len(chat_key) > 8 else chat_key
+
+    @staticmethod
+    def _shadow_trigger_match(message: Any, preset_name: str = "") -> tuple[bool, str]:
+        """按核心的显式触发语义计算影子结果，不参与实际调度。"""
+
+        if bool(getattr(message, "is_tome", False)):
+            return True, "is_tome"
+        content = str(getattr(message, "content_text", "") or "")
+        name = preset_name.strip()
+        if name and name in content:
+            return True, "preset_name"
+        return False, "none"
+
+    @staticmethod
+    def _shadow_sender_label(message: Any) -> str:
+        sender = sender_bucket(message)
+        return hashlib.sha256(sender.encode("utf-8")).hexdigest()[:10] if sender else "unknown"
+
+    async def _observe_trigger_scope(self, ctx: Any, message: Any, current_buffer: ChatBuffer | None) -> None:
+        """记录候选门控结果；此方法不得改变消息、缓冲或返回信号。"""
+
+        if not getattr(self.config, "observe_trigger_scope", False):
+            return
+        try:
+            preset_name = ""
+            current_preset = getattr(ctx, "current_preset", None)
+            if callable(current_preset):
+                preset = await current_preset()
+                preset_name = str(getattr(preset, "name", "") or "")
+            matched, source = self._shadow_trigger_match(message, preset_name)
+            chat_key = str(getattr(message, "chat_key", "") or "")
+            sender = sender_bucket(message)
+            pending = self.buffers.for_chat(chat_key)
+            same_sender = current_buffer is not None and current_buffer.sender_bucket == sender
+            other_senders = {
+                buffer.sender_bucket
+                for buffer in pending
+                if buffer.sender_bucket and buffer.sender_bucket != sender
+            }
+            decision = "same_sender_continuation" if same_sender else (
+                "new_trigger_batch" if matched else "background_or_untriggered"
+            )
+            self.logger.info(
+                f"[Debounce][Observe] chat={self._debug_chat_key(chat_key)} "
+                f"sender={self._shadow_sender_label(message)} "
+                f"trigger_match={matched} source={source} "
+                f"current_sender_batch={same_sender} pending_batches={len(pending)} "
+                f"other_sender_pending={len(other_senders)} "
+                f"decision={decision} behavior=unchanged",
+            )
+        except Exception as exc:
+            self.logger.warning(f"[Debounce][Observe] 触发范围观测失败，已忽略：{type(exc).__name__}")
 
     async def _get_release_channel(self, chat_key: str) -> Any:
         """通过 Nekro 公共模型 API 读取释放前的频道状态。"""

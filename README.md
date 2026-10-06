@@ -1,6 +1,6 @@
 # NekroAgent 消息防抖
 
-版本：`0.4.3`
+版本：`0.4.4`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
@@ -27,6 +27,9 @@
 | `usage_scope` | `both` | `both`、`group`、`private` |
 | `cancel_on_new_message` | `true` | 字段保留；Nekro v0.4.0 不取消运行中的 Agent |
 | `debug_logging` | `false` | 开启后在日志中记录概率变化、阈值、等待窗口和释放原因 |
+| `observe_trigger_scope` | `false` | 仅记录触发资格、发送者批次归属和跨发送者 pending 情况，不改变行为 |
+
+`observe_trigger_scope` 是影子观测开关。开启后，日志中的 `decision` 只表示“如果启用触发门控，当前消息可能属于哪一类”，不代表插件已经采用该规则。`same_sender_continuation` 表示当前发送者已有批次，`new_trigger_batch` 表示消息本身满足 `is_tome` 或人设名称匹配，`background_or_untriggered` 表示消息未满足这两种触发条件。观测期间仍保留当前版本的缓冲、阻止和超时重放行为；日志不记录完整消息文本。
 
 每条文本消息都会基于当前频道的累计文本重新分类。第一条消息始终使用普通静默窗口；后续消息只有在达到 `high_confidence_threshold` 时才进入高置信度等待，其余情况使用普通窗口。高置信度等待会参考本批最近最多 3 个消息间隔，按 `max(high_confidence_timeout_seconds, 最大近期间隔 × cadence_multiplier + cadence_margin_seconds)` 计算，并且不超过普通静默窗口和最大等待期限。缺少可用时间记录时使用配置的最短高置信度等待。静默结束时会重新分类，概率下降时恢复普通等待，直到语义完整或达到 `max_wait_seconds` 后强制触发。模型加载或推理失败时，当前批次退化为普通时间防抖。
 

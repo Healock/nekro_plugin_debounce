@@ -13,7 +13,7 @@ plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
     description="结合语义完整性和静默时间窗口合并连续消息。",
-    version="0.4.3",
+    version="0.4.4",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -87,6 +87,11 @@ class DebounceConfig(ConfigBase):
         default=False,
         title="启用调试日志",
         description="开启后记录完整性概率、近期发送间隔、等待状态和释放原因。",
+    )
+    observe_trigger_scope: bool = Field(
+        default=False,
+        title="观测触发范围",
+        description="仅记录触发资格和发送者批次归属的影子判断，不改变消息处理行为。",
     )
 
     @model_validator(mode="after")

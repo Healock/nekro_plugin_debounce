@@ -21,6 +21,7 @@ class Message:
     sender_id: str = "u1"
     sender_name: str = "User"
     sender_nickname: str = "User"
+    is_tome: int = 0
     content_text: str = ""
     content_data: list[dict] = field(default_factory=list)
 
@@ -38,7 +39,21 @@ def test_config_uses_hybrid_defaults() -> None:
     assert config.usage_scope == "both"
     assert config.cancel_on_new_message is True
     assert config.debug_logging is False
+    assert config.observe_trigger_scope is False
     assert "debounce_mode" not in DebounceConfig.model_fields
+
+
+def test_shadow_trigger_match_uses_core_trigger_semantics() -> None:
+    from nekro_plugin_debounce import plugin
+    from nekro_plugin_debounce.lifecycle import DebounceRuntime
+
+    runtime = DebounceRuntime(plugin, DebounceConfig())
+    assert runtime._shadow_trigger_match(Message(content_text="你好", is_tome=1)) == (True, "is_tome")
+    assert runtime._shadow_trigger_match(Message(content_text="你好绵绵", is_tome=0), "绵绵") == (
+        True,
+        "preset_name",
+    )
+    assert runtime._shadow_trigger_match(Message(content_text="普通群聊", is_tome=0), "绵绵") == (False, "none")
 
 
 def test_config_rejects_max_wait_shorter_than_quiet_window() -> None:
