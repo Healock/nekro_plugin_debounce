@@ -12,16 +12,11 @@ from nekro_agent.schemas.signal import MsgSignal
 from .buffer import BufferManager
 from .classifier import ClassificationResult, ClassifierAdapter
 from .compat import (
-    REPLAY_MARKER,
     buffer_key,
     content_data_to_dicts,
     has_hard_boundary,
-    is_replay_message,
-    merge_into_message,
-    merge_message_content,
     message_event_id,
     message_id,
-    restore_segments,
     sender_id,
     sender_name,
     sender_bucket,
@@ -229,9 +224,6 @@ class DebounceRuntime:
     async def handle_user_message(self, _ctx: Any, message: Any) -> MsgSignal:
         if self._stopping or not self.config.enabled or not usage_scope_matches(message, self.config.usage_scope):
             return MsgSignal.CONTINUE
-        if is_replay_message(message):
-            return MsgSignal.CONTINUE
-
         chat_key = str(getattr(message, "chat_key", "") or "")
         if not chat_key:
             return MsgSignal.CONTINUE
@@ -278,14 +270,14 @@ class DebounceRuntime:
                     return MsgSignal.CONTINUE
                 if not await self._apply_wait_policy(buffer):
                     return MsgSignal.CONTINUE
-                return MsgSignal.BLOCK_ALL
+                return MsgSignal.BLOCK_TRIGGER
             if buffer.classifier_fallback:
-                return MsgSignal.BLOCK_ALL
+                return MsgSignal.BLOCK_TRIGGER
 
             result = await self._classify_buffer(buffer)
             if result is not None and not await self._apply_wait_policy(buffer):
                 return MsgSignal.CONTINUE
-            return MsgSignal.BLOCK_ALL
+            return MsgSignal.BLOCK_TRIGGER
 
     async def _buffer_message(
         self,
@@ -359,7 +351,7 @@ class DebounceRuntime:
         try:
             await self.journal.append(record)
         except JournalError as exc:
-            self.logger.exception(f"[Debounce] BLOCK_ALL 前 journal 写入失败，当前消息放行: {exc}")
+            self.logger.exception(f"[Debounce] BLOCK_TRIGGER 前 journal 写入失败，当前消息放行: {exc}")
             return None
 
         envelope = MessageEnvelope(
@@ -796,7 +788,7 @@ class DebounceRuntime:
         taken = self.buffers.take(current.buffer_key, current.generation)
         return taken
 
-    async def _merge_and_trigger(self, message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
+    async def _merge_and_trigger(self, _message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
         try:
             released = await self._release_gate(buffer, reason)
         except JournalError as exc:
@@ -805,20 +797,14 @@ class DebounceRuntime:
         if released is None:
             return MsgSignal.CONTINUE
         try:
-            merge_into_message(message, released.messages)
-        except Exception as exc:
-            self.logger.exception(f"[Debounce] 消息合并失败，当前消息 fail-open，pending 保留: {exc}")
-            try:
-                await self.journal.mark_manual_recovery(released.record_ids, f"merge_failed:{reason}")
-            except JournalError as journal_exc:
-                self.logger.exception(f"[Debounce] 合并失败批次无法标记人工恢复: {journal_exc}")
-            return MsgSignal.CONTINUE
-        try:
-            await self.journal.mark_manual_recovery(released.record_ids, f"outer_persist_unconfirmed:{reason}")
+            await self.journal.acknowledge(released.record_ids)
         except JournalError as exc:
-            self.logger.exception(f"[Debounce] 合并后更新 journal 失败，保留原记录: {exc}")
+            self.logger.exception(f"[Debounce] 媒体边界已释放，但 journal 清理失败: {exc}")
         if self.config.debug_logging:
-            self.logger.info(f"[Debounce] release_reason={reason} text_length={len(getattr(message, 'content_text', '') or '')}")
+            self.logger.info(
+                f"[Debounce] release_reason={reason} dispatch=core_current_message "
+                f"pending_messages={len(released.messages)}",
+            )
         return MsgSignal.FORCE_TRIGGER
 
     async def _on_timeout(self, internal_key: str, generation: int) -> None:
@@ -893,11 +879,11 @@ class DebounceRuntime:
             return
         record_ids = taken.record_ids
         try:
-            await self._replay_as_human_message(taken)
+            await self._schedule_agent_from_history(taken)
         except Exception as exc:
-            self.logger.exception(f"[Debounce] timeout 用户消息重放失败，保留人工恢复记录: {exc}")
+            self.logger.exception(f"[Debounce] timeout 历史调度失败，保留人工恢复记录: {exc}")
             try:
-                await self.journal.mark_manual_recovery(record_ids, f"timeout_human_replay_failed:{reason}")
+                await self.journal.mark_manual_recovery(record_ids, f"history_dispatch_failed:{reason}")
             except JournalError:
                 pass
             return
@@ -905,42 +891,23 @@ class DebounceRuntime:
         try:
             await self.journal.acknowledge(record_ids)
         except JournalError as exc:
-            self.logger.exception(f"[Debounce] timeout 已调用但 journal 清理失败: {exc}")
+            self.logger.exception(f"[Debounce] timeout 已调度但 journal 清理失败: {exc}")
         if self.config.debug_logging:
-            self.logger.info(f"[Debounce] release_reason={reason} text_length={len(taken.text)}")
+            self.logger.info(
+                f"[Debounce] release_reason={reason} dispatch=history "
+                f"pending_messages={len(taken.messages)}",
+            )
 
-    async def _replay_as_human_message(self, buffer: ChatBuffer) -> None:
-        """将超时缓冲重新交给用户消息入口，避免生成 SYSTEM 消息。"""
+    async def _schedule_agent_from_history(self, buffer: ChatBuffer) -> None:
+        """调度 Agent 读取已落库的原始消息，不构造合成用户消息。"""
 
-        from nekro_agent.schemas.chat_message import ChatMessage, ChatType
+        from nekro_agent.schemas.agent_ctx import AgentCtx
         from nekro_agent.services.message_service import message_service
 
-        channel = await self._get_release_channel(buffer.chat_key)
-        last_message = buffer.messages[-1]
-        content_text, content_data = merge_message_content(
-            [(item.text, item.content_data) for item in buffer.messages],
-        )
-        message = ChatMessage(
-            message_id=f"debounce-{buffer.generation}-{last_message.message_id or last_message.event_id}",
-            sender_id=last_message.sender_id or "0",
-            sender_name=last_message.sender_name or "未知用户",
-            sender_nickname=last_message.sender_nickname or last_message.sender_name or "未知用户",
-            adapter_key=last_message.adapter_key or channel.adapter_key,
-            platform_userid=last_message.platform_userid or "0",
-            is_tome=0,
-            is_recalled=False,
+        ctx = await AgentCtx.create_by_chat_key(chat_key=buffer.chat_key)
+        await message_service.schedule_agent_task(
             chat_key=buffer.chat_key,
-            chat_type=ChatType(channel.chat_type),
-            content_text=content_text,
-            content_data=restore_segments(content_data),
-            raw_cq_code=last_message.raw_cq_code,
-            ext_data={REPLAY_MARKER: True},
-            send_timestamp=int(time.time()),
-        )
-        await message_service.push_human_message(
-            message=message,
-            trigger_agent=True,
-            db_chat_channel=channel,
+            ctx=ctx,
         )
 
 

@@ -46,10 +46,10 @@ async def test_reset_cancels_pending_generation_and_new_message_starts_new_batch
         replayed.append(buffer.text)
 
     runtime.classifier.classify = classify  # type: ignore[method-assign]
-    runtime._replay_as_human_message = capture  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = capture  # type: ignore[method-assign]
 
     first = Message(message_id="before-reset")
-    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_TRIGGER"
     old_buffer = runtime.buffers.get("chat")
     assert old_buffer is not None
 
@@ -61,7 +61,7 @@ async def test_reset_cancels_pending_generation_and_new_message_starts_new_batch
     assert await JournalStore(plugin.store).load() == []
 
     second = Message(message_id="after-reset", content_text="new", content_data=[{"type": "text", "text": "new"}])
-    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_TRIGGER"
     new_buffer = runtime.buffers.get("chat")
     assert new_buffer is not None
     assert new_buffer.generation > old_buffer.generation
@@ -190,7 +190,7 @@ async def test_messages_do_not_wait_for_pending_classifier_preload() -> None:
     await preload_started.wait()
 
     result = await runtime.handle_user_message(None, Message(message_id="during-preload"))
-    assert result.name == "BLOCK_ALL"
+    assert result.name == "BLOCK_TRIGGER"
     buffer = runtime.buffers.get("chat")
     assert buffer is not None and buffer.classifier_fallback
     await runtime.stop()

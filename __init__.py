@@ -12,8 +12,8 @@ from nekro_agent.api.plugin import ConfigBase, NekroPlugin
 plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
-    description="结合语义完整性和静默时间窗口合并连续消息。",
-    version="0.4.5",
+    description="保留原始消息，仅按语义和静默时间控制 Agent 触发。",
+    version="0.5.0",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -33,7 +33,7 @@ class DebounceConfig(ConfigBase):
         ge=0.0,
         le=1.0,
         title="完整性概率阈值",
-        description="达到该概率后发送合并消息。",
+        description="达到该概率后允许在静默窗口结束时触发 Agent。",
     )
     high_confidence_threshold: float = Field(
         default=0.95,

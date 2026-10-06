@@ -62,7 +62,7 @@ async def _ready_runtime(*, complete: bool = True) -> tuple[DebounceRuntime, obj
 
 async def _pending(runtime: DebounceRuntime, message_id: str = "gate-1"):
     result = await runtime.handle_user_message(None, Message(message_id=message_id))
-    assert result.name == "BLOCK_ALL"
+    assert result.name == "BLOCK_TRIGGER"
     buffer = runtime.buffers.get("gate-chat")
     assert buffer is not None
     buffer.quiet_deadline = time.time() - 1
@@ -76,7 +76,7 @@ async def test_timeout_release_gate_discards_observe_or_inactive_batch(status) -
     runtime, channel = await _ready_runtime()
     channel.is_active, channel.observe_mode = status
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
     buffer = await _pending(runtime)
 
     await runtime._on_timeout(buffer.buffer_key, buffer.generation)
@@ -94,7 +94,7 @@ async def test_max_wait_and_classifier_fallback_use_release_gate() -> None:
     for fallback in (False, True):
         runtime, channel = await _ready_runtime(complete=not fallback)
         replayed: list[str] = []
-        runtime._replay_as_human_message = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
+        runtime._schedule_agent_from_history = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
         if fallback:
             async def fail(*_args):
                 raise RuntimeError("unavailable")
@@ -127,7 +127,7 @@ async def test_resume_does_not_replay_canceled_batch_and_invalidate_is_idempoten
     channel.is_active = True
 
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda current: replayed.append(current.text)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda current: replayed.append(current.text)  # type: ignore[method-assign]
     await runtime._on_timeout(buffer.buffer_key, old_generation)
     assert replayed == []
     assert (await runtime.journal.records())[0].state == JournalState.CANCELED
@@ -143,7 +143,7 @@ async def test_resume_does_not_replay_canceled_batch_and_invalidate_is_idempoten
 async def test_duplicate_release_and_generation_or_journal_gate_are_safe() -> None:
     runtime, _channel_obj = await _ready_runtime()
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
     buffer = await _pending(runtime)
 
     await runtime._on_timeout(buffer.buffer_key, buffer.generation + 1)
@@ -162,7 +162,7 @@ async def test_duplicate_release_and_generation_or_journal_gate_are_safe() -> No
 async def test_release_gate_ignores_legacy_record_with_same_generation() -> None:
     runtime, _channel_obj = await _ready_runtime()
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda buffer: replayed.append(buffer.text)  # type: ignore[method-assign]
     buffer = await _pending(runtime, "current")
 
     await runtime.journal.append(
@@ -205,14 +205,23 @@ async def test_media_boundary_uses_the_same_channel_release_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replay_constructs_one_raw_user_message_without_tome_flag() -> None:
+async def test_timeout_dispatches_history_without_constructing_user_message() -> None:
     runtime, _channel_obj = await _ready_runtime()
     captured = []
 
-    async def capture(**kwargs):
-        captured.append(kwargs["message"])
+    class _Ctx:
+        pass
 
-    message_service.push_human_message = capture  # type: ignore[method-assign]
+    async def create_by_chat_key(*, chat_key):
+        return _Ctx()
+
+    async def schedule_agent_task(**kwargs):
+        captured.append(kwargs)
+
+    from nekro_agent.schemas import agent_ctx
+
+    agent_ctx.AgentCtx.create_by_chat_key = create_by_chat_key  # type: ignore[method-assign]
+    message_service.schedule_agent_task = schedule_agent_task  # type: ignore[method-assign]
     buffer = ChatBuffer(
         chat_key="gate-chat",
         buffer_key="gate-chat\x1fu1",
@@ -234,9 +243,9 @@ async def test_replay_constructs_one_raw_user_message_without_tome_flag() -> Non
         ],
     )
 
-    await runtime._replay_as_human_message(buffer)
+    await runtime._schedule_agent_from_history(buffer)
 
     assert len(captured) == 1
-    assert captured[0].is_tome == 0
-    assert captured[0].ext_data
+    assert captured[0]["chat_key"] == "gate-chat"
+    assert isinstance(captured[0]["ctx"], _Ctx)
     await runtime.stop()
