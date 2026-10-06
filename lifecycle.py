@@ -655,13 +655,19 @@ class DebounceRuntime:
             decision = "same_sender_continuation" if same_sender else (
                 "new_trigger_batch" if matched else "background_or_untriggered"
             )
+            if self._is_group_message(message) and not same_sender and not matched:
+                behavior = "continued_to_core"
+            elif same_sender or matched:
+                behavior = "debounce_batch"
+            else:
+                behavior = "private_debounce_batch"
             self.logger.info(
                 f"[Debounce][Observe] chat={self._debug_chat_key(chat_key)} "
                 f"sender={self._shadow_sender_label(message)} "
                 f"trigger_match={matched} source={source} "
                 f"current_sender_batch={same_sender} pending_batches={len(pending)} "
                 f"other_sender_pending={len(other_senders)} "
-                f"decision={decision} behavior=unchanged",
+                f"decision={decision} behavior={behavior}",
             )
         except Exception as exc:
             self.logger.warning(f"[Debounce][Observe] 触发范围观测失败，已忽略：{type(exc).__name__}")
