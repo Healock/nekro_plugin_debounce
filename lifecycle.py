@@ -239,8 +239,9 @@ class DebounceRuntime:
         lock = self.buffers.lock_for(chat_key)
         async with lock:
             current_buffer = self.buffers.get(internal_key)
+            trigger_match, trigger_source = await self._trigger_match(_ctx, message)
             asyncio.create_task(
-                self._observe_trigger_scope(_ctx, message, current_buffer),
+                self._observe_trigger_scope(_ctx, message, current_buffer, trigger_match, trigger_source),
                 name="debounce-trigger-scope-observation",
             )
             if has_hard_boundary(message):
@@ -250,6 +251,11 @@ class DebounceRuntime:
 
             current_text = str(getattr(message, "content_text", "") or "")
             if not current_text.strip() and not getattr(message, "content_data", None):
+                return MsgSignal.CONTINUE
+
+            # 群聊只接管已触发消息，以及同一发送者已经启动的批次。
+            # 未触发的首条消息必须继续走核心的正常入库流程，不能被防抖插件阻止。
+            if self._is_group_message(message) and current_buffer is None and not trigger_match:
                 return MsgSignal.CONTINUE
 
             buffer = await self._buffer_message(message, current_buffer, internal_key)
@@ -581,8 +587,14 @@ class DebounceRuntime:
         return f"{chat_key[:4]}...{chat_key[-4:]}" if len(chat_key) > 8 else chat_key
 
     @staticmethod
+    def _is_group_message(message: Any) -> bool:
+        chat_type = getattr(message, "chat_type", "")
+        chat_type = str(getattr(chat_type, "value", chat_type)).lower()
+        return chat_type == "group"
+
+    @staticmethod
     def _shadow_trigger_match(message: Any, preset_name: str = "") -> tuple[bool, str]:
-        """按核心的显式触发语义计算影子结果，不参与实际调度。"""
+        """按核心的显式触发语义计算消息是否具备启动资格。"""
 
         if bool(getattr(message, "is_tome", False)):
             return True, "is_tome"
@@ -592,23 +604,45 @@ class DebounceRuntime:
             return True, "preset_name"
         return False, "none"
 
+    async def _trigger_match(self, ctx: Any, message: Any) -> tuple[bool, str]:
+        """读取当前人设名称，计算与核心一致的消息触发资格。"""
+
+        if bool(getattr(message, "is_tome", False)):
+            return True, "is_tome"
+        current_preset = getattr(ctx, "current_preset", None)
+        if not callable(current_preset):
+            return False, "preset_unavailable"
+        try:
+            preset = current_preset()
+            if hasattr(preset, "__await__"):
+                preset = await preset
+            preset_name = str(getattr(preset, "name", "") or "")
+        except Exception:
+            return False, "preset_unavailable"
+        return self._shadow_trigger_match(message, preset_name)
+
     @staticmethod
     def _shadow_sender_label(message: Any) -> str:
         sender = sender_bucket(message)
         return hashlib.sha256(sender.encode("utf-8")).hexdigest()[:10] if sender else "unknown"
 
-    async def _observe_trigger_scope(self, ctx: Any, message: Any, current_buffer: ChatBuffer | None) -> None:
+    async def _observe_trigger_scope(
+        self,
+        ctx: Any,
+        message: Any,
+        current_buffer: ChatBuffer | None,
+        trigger_match: bool | None = None,
+        trigger_source: str | None = None,
+    ) -> None:
         """记录候选门控结果；此方法不得改变消息、缓冲或返回信号。"""
 
         if not getattr(self.config, "observe_trigger_scope", False):
             return
         try:
-            preset_name = ""
-            current_preset = getattr(ctx, "current_preset", None)
-            if callable(current_preset):
-                preset = await current_preset()
-                preset_name = str(getattr(preset, "name", "") or "")
-            matched, source = self._shadow_trigger_match(message, preset_name)
+            if trigger_match is None or trigger_source is None:
+                matched, source = await self._trigger_match(ctx, message)
+            else:
+                matched, source = trigger_match, trigger_source
             chat_key = str(getattr(message, "chat_key", "") or "")
             sender = sender_bucket(message)
             pending = self.buffers.for_chat(chat_key)

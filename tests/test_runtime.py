@@ -154,6 +154,7 @@ async def test_group_messages_from_different_senders_use_separate_buffers() -> N
         chat_type="group",
         sender_id="user-a",
         message_id="a-1",
+        is_tome=1,
         content_text="用户 A 的消息",
         content_data=[{"type": "text", "text": "用户 A 的消息"}],
     )
@@ -162,6 +163,7 @@ async def test_group_messages_from_different_senders_use_separate_buffers() -> N
         chat_type="group",
         sender_id="user-b",
         message_id="b-1",
+        is_tome=1,
         content_text="用户 B 的消息",
         content_data=[{"type": "text", "text": "用户 B 的消息"}],
     )
@@ -176,6 +178,59 @@ async def test_group_messages_from_different_senders_use_separate_buffers() -> N
         await runtime._on_timeout(buffer.buffer_key, buffer.generation)
 
     assert sorted(replayed) == [("user-a", "用户 A 的消息"), ("user-b", "用户 B 的消息")]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_untriggered_group_message_passes_without_creating_buffer() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    message = Message(
+        chat_key="group",
+        chat_type="group",
+        message_id="background-1",
+        content_text="群里的普通消息",
+        content_data=[{"type": "text", "text": "群里的普通消息"}],
+    )
+
+    assert (await runtime.handle_user_message(None, message)).name == "CONTINUE"
+    assert not runtime.buffers.for_chat("group")
+    assert await runtime.journal.records() == []
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_triggered_group_message_starts_batch_and_same_sender_continues() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
+    first = Message(
+        chat_key="group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="trigger-1",
+        is_tome=1,
+        content_text="@Bot 请回答",
+        content_data=[{"type": "text", "text": "@Bot 请回答"}],
+    )
+    continuation = Message(
+        chat_key="group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="trigger-2",
+        content_text="这是补充说明",
+        content_data=[{"type": "text", "text": "这是补充说明"}],
+    )
+
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, continuation)).name == "BLOCK_ALL"
+    buffer = runtime.buffers.get("group\x1fuser-a")
+    assert buffer is not None
+    assert buffer.text == "@Bot 请回答 这是补充说明"
     await runtime.stop()
 
 
