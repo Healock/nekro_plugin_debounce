@@ -8,12 +8,14 @@ from pydantic import Field, model_validator
 
 from nekro_agent.api.plugin import ConfigBase, NekroPlugin
 
+from .capability import DebounceBridge
+
 
 plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
     description="保留原始消息，仅按语义和静默时间控制 Agent 触发。",
-    version="0.5.0",
+    version="0.5.1",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -113,6 +115,7 @@ from .lifecycle import DebounceRuntime, register_lifecycle  # noqa: E402
 from .matcher import register_matcher  # noqa: E402
 
 runtime = DebounceRuntime(plugin, config)
+plugin.debounce_bridge = DebounceBridge(runtime)
 register_matcher(plugin, runtime)
 register_lifecycle(plugin, runtime)
 

@@ -1,6 +1,6 @@
 # NekroAgent 消息防抖
 
-版本：`0.5.0`
+版本：`0.5.1`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
@@ -77,9 +77,12 @@ ONNX Runtime、Transformers、NumPy 和 ModelScope 在插件初始化阶段开�
 `nekro_plugin_debounce.invalidate_channel(chat_key, reason)`，该入口是幂等的，
 不会让调度器对防抖插件形成硬依赖。
 
+Schedule 通过已加载插件实例上的 `debounce_bridge` 能力调用频道失效，不依赖插件源码的
+Python 导入路径。该能力版本为 `1`；没有 pending 批次也会返回已确认结果。
+
 ## Nekro API 差异
 
-当前 Nekro 不实现 AstrBot 的 ProviderRequest 改写、运行中 Agent 取消和旧回复丢弃。v0.5.0 不再使用通用用户消息伪造或超时重放；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。插件使用当前 Nekro 内部的历史调度接口，升级时需复核接口兼容性。
+当前 Nekro 不实现 AstrBot 的 ProviderRequest 改写、运行中 Agent 取消和旧回复丢弃。v0.5.1 不再使用通用用户消息伪造或超时重放；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。插件使用当前 Nekro 内部的历史调度接口，升级时需复核接口兼容性。
 
 ## 验证边界
 
