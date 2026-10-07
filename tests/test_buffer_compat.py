@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 from nekro_plugin_debounce.compat import (
     has_hard_boundary,
-    is_replay_message,
-    merge_into_message,
     text_compatible,
     usage_scope_matches,
 )
@@ -34,33 +32,9 @@ def test_text_and_at_are_classifier_safe() -> None:
     assert not has_hard_boundary(message)
 
 
-def test_media_is_hard_boundary_and_merge_preserves_order() -> None:
-    pending = Message(content_text="先说", content_data=[Segment("text", "先说")])
+def test_media_is_hard_boundary() -> None:
     current = Message(content_text="图片", content_data=[Segment("image", "[图片]")])
     assert has_hard_boundary(current)
-    merge_into_message(current, [pending])
-    assert current.content_text == "先说 图片"
-    assert [item["type"] for item in current.content_data] == ["text", "image"]
-
-
-def test_merge_deduplicates_same_at_target() -> None:
-    pending = Message(
-        content_text="@bot 第一段",
-        content_data=[
-            {"type": "at", "text": "@bot", "target_platform_userid": "bot", "target_nickname": "Bot"},
-            {"type": "text", "text": " 第一段"},
-        ],
-    )
-    current = Message(
-        content_text="@bot 第二段",
-        content_data=[
-            {"type": "at", "text": "@bot", "target_platform_userid": "bot", "target_nickname": "Bot"},
-            {"type": "text", "text": " 第二段"},
-        ],
-    )
-    merge_into_message(current, [pending])
-    assert current.content_text == "@bot 第一段 第二段"
-    assert sum(item["type"] == "at" for item in current.content_data) == 1
 
 
 def test_usage_scope_matches_chat_type() -> None:
@@ -70,10 +44,3 @@ def test_usage_scope_matches_chat_type() -> None:
     assert usage_scope_matches(group, "group")
     assert not usage_scope_matches(group, "private")
     assert usage_scope_matches(private, "private")
-
-
-def test_replay_marker_is_explicit() -> None:
-    assert is_replay_message(Message()) is False
-    message = Message()
-    message.ext_data = {"_nekro_plugin_debounce_replay": True}  # type: ignore[attr-defined]
-    assert is_replay_message(message) is True

@@ -8,12 +8,14 @@ from pydantic import Field, model_validator
 
 from nekro_agent.api.plugin import ConfigBase, NekroPlugin
 
+from .capability import DebounceBridge
+
 
 plugin = NekroPlugin(
     name="消息防抖",
     module_name="nekro_plugin_debounce",
-    description="结合语义完整性和静默时间窗口合并连续消息。",
-    version="0.4.3",
+    description="保留原始消息，仅按语义和静默时间控制 Agent 触发。",
+    version="0.5.1",
     author="Healock",
     url="https://github.com/Healock/nekro_plugin_debounce",
     support_adapter=[],
@@ -33,7 +35,7 @@ class DebounceConfig(ConfigBase):
         ge=0.0,
         le=1.0,
         title="完整性概率阈值",
-        description="达到该概率后发送合并消息。",
+        description="达到该概率后允许在静默窗口结束时触发 Agent。",
     )
     high_confidence_threshold: float = Field(
         default=0.95,
@@ -88,6 +90,11 @@ class DebounceConfig(ConfigBase):
         title="启用调试日志",
         description="开启后记录完整性概率、近期发送间隔、等待状态和释放原因。",
     )
+    observe_trigger_scope: bool = Field(
+        default=False,
+        title="观测触发范围",
+        description="记录实际触发资格、发送者批次归属和跨发送者 pending 情况。",
+    )
 
     @model_validator(mode="after")
     def validate_waiting_window(self) -> "DebounceConfig":
@@ -108,6 +115,7 @@ from .lifecycle import DebounceRuntime, register_lifecycle  # noqa: E402
 from .matcher import register_matcher  # noqa: E402
 
 runtime = DebounceRuntime(plugin, config)
+plugin.debounce_bridge = DebounceBridge(runtime)
 register_matcher(plugin, runtime)
 register_lifecycle(plugin, runtime)
 

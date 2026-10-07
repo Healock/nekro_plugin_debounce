@@ -8,9 +8,6 @@ from typing import Any
 
 
 SAFE_SEGMENT_TYPES = {"text", "at"}
-REPLAY_MARKER = "_nekro_plugin_debounce_replay"
-
-
 def segment_type_name(segment: Any) -> str:
     """返回稳定的消息段类型名称。"""
 
@@ -44,17 +41,6 @@ def segment_to_dict(segment: Any) -> dict[str, Any]:
 
 def content_data_to_dicts(content_data: Sequence[Any] | None) -> list[dict[str, Any]]:
     return [segment_to_dict(segment) for segment in (content_data or [])]
-
-
-def restore_segments(data: Sequence[Mapping[str, Any]]) -> list[Any]:
-    """尽量恢复成 Nekro 的消息段模型；测试环境没有 Nekro 时保留字典。"""
-
-    try:
-        from nekro_agent.schemas.chat_message import segments_from_list
-
-        return segments_from_list([dict(item) for item in data])
-    except (ImportError, ModuleNotFoundError, KeyError, TypeError, ValueError):
-        return [dict(item) for item in data]
 
 
 def message_event_id(message: Any) -> str:
@@ -98,13 +84,6 @@ def buffer_key(chat_key: str, sender_key: str) -> str:
     return f"{chat_key}\x1f{sender_key}"
 
 
-def is_replay_message(message: Any) -> bool:
-    """判断消息是否由防抖超时流程重新提交。"""
-
-    ext_data = getattr(message, "ext_data", None)
-    return isinstance(ext_data, Mapping) and ext_data.get(REPLAY_MARKER) is True
-
-
 def text_compatible(message: Any) -> bool:
     """纯文本和 AT 可以进入完整性分类器。"""
 
@@ -115,59 +94,6 @@ def text_compatible(message: Any) -> bool:
 def has_hard_boundary(message: Any) -> bool:
     data = getattr(message, "content_data", None) or []
     return bool(data) and not text_compatible(message)
-
-
-def merge_text(parts: Sequence[str]) -> str:
-    return " ".join(part.strip() for part in parts if part and part.strip())
-
-
-def _at_key(segment: Mapping[str, Any]) -> tuple[str, str] | None:
-    if str(segment.get("type", "")).lower() != "at":
-        return None
-    target = segment.get("target_platform_userid") or segment.get("target_nickname") or segment.get("text")
-    return "at", str(target)
-
-
-def merge_message_content(
-    parts: Sequence[tuple[str, Sequence[Any]]],
-) -> tuple[str, list[dict[str, Any]]]:
-    """合并消息文本和消息段，并去除重复的同一目标 @。"""
-
-    seen_at: set[tuple[str, str]] = set()
-    text_parts: list[str] = []
-    segment_dicts: list[dict[str, Any]] = []
-    for text, content_data in parts:
-        current_segments = content_data_to_dicts(content_data)
-        current_text = str(text or "")
-        for segment in current_segments:
-            key = _at_key(segment)
-            if key is not None:
-                token = str(segment.get("text", "") or "")
-                if key in seen_at:
-                    if token:
-                        current_text = current_text.replace(token, "", 1)
-                    continue
-                seen_at.add(key)
-            segment_dicts.append(segment)
-        text_parts.append(current_text)
-    return merge_text(text_parts), segment_dicts
-
-
-def merge_into_message(message: Any, envelopes: Sequence[Any]) -> None:
-    """将缓冲内容按顺序写回当前 ChatMessage。"""
-
-    parts = [
-        (
-            str(getattr(item, "text", getattr(item, "content_text", "")) or ""),
-            getattr(item, "content_data", []),
-        )
-        for item in envelopes
-    ]
-    parts.append((str(getattr(message, "content_text", "") or ""), getattr(message, "content_data", [])))
-    merged_text, segment_dicts = merge_message_content(parts)
-    merged_segments = restore_segments(segment_dicts)
-    message.content_text = merged_text
-    message.content_data = merged_segments
 
 
 def usage_scope_matches(message: Any, usage_scope: str) -> bool:

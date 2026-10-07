@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Any
 
@@ -11,16 +12,11 @@ from nekro_agent.schemas.signal import MsgSignal
 from .buffer import BufferManager
 from .classifier import ClassificationResult, ClassifierAdapter
 from .compat import (
-    REPLAY_MARKER,
     buffer_key,
     content_data_to_dicts,
     has_hard_boundary,
-    is_replay_message,
-    merge_into_message,
-    merge_message_content,
     message_event_id,
     message_id,
-    restore_segments,
     sender_id,
     sender_name,
     sender_bucket,
@@ -228,9 +224,6 @@ class DebounceRuntime:
     async def handle_user_message(self, _ctx: Any, message: Any) -> MsgSignal:
         if self._stopping or not self.config.enabled or not usage_scope_matches(message, self.config.usage_scope):
             return MsgSignal.CONTINUE
-        if is_replay_message(message):
-            return MsgSignal.CONTINUE
-
         chat_key = str(getattr(message, "chat_key", "") or "")
         if not chat_key:
             return MsgSignal.CONTINUE
@@ -238,6 +231,11 @@ class DebounceRuntime:
         lock = self.buffers.lock_for(chat_key)
         async with lock:
             current_buffer = self.buffers.get(internal_key)
+            trigger_match, trigger_source = await self._trigger_match(_ctx, message)
+            asyncio.create_task(
+                self._observe_trigger_scope(_ctx, message, current_buffer, trigger_match, trigger_source),
+                name="debounce-trigger-scope-observation",
+            )
             if has_hard_boundary(message):
                 if current_buffer is None or not current_buffer.messages:
                     return MsgSignal.CONTINUE
@@ -245,6 +243,11 @@ class DebounceRuntime:
 
             current_text = str(getattr(message, "content_text", "") or "")
             if not current_text.strip() and not getattr(message, "content_data", None):
+                return MsgSignal.CONTINUE
+
+            # 群聊只接管已触发消息，以及同一发送者已经启动的批次。
+            # 未触发的首条消息必须继续走核心的正常入库流程，不能被防抖插件阻止。
+            if self._is_group_message(message) and current_buffer is None and not trigger_match:
                 return MsgSignal.CONTINUE
 
             buffer = await self._buffer_message(message, current_buffer, internal_key)
@@ -267,14 +270,14 @@ class DebounceRuntime:
                     return MsgSignal.CONTINUE
                 if not await self._apply_wait_policy(buffer):
                     return MsgSignal.CONTINUE
-                return MsgSignal.BLOCK_ALL
+                return MsgSignal.BLOCK_TRIGGER
             if buffer.classifier_fallback:
-                return MsgSignal.BLOCK_ALL
+                return MsgSignal.BLOCK_TRIGGER
 
             result = await self._classify_buffer(buffer)
             if result is not None and not await self._apply_wait_policy(buffer):
                 return MsgSignal.CONTINUE
-            return MsgSignal.BLOCK_ALL
+            return MsgSignal.BLOCK_TRIGGER
 
     async def _buffer_message(
         self,
@@ -348,7 +351,7 @@ class DebounceRuntime:
         try:
             await self.journal.append(record)
         except JournalError as exc:
-            self.logger.exception(f"[Debounce] BLOCK_ALL 前 journal 写入失败，当前消息放行: {exc}")
+            self.logger.exception(f"[Debounce] BLOCK_TRIGGER 前 journal 写入失败，当前消息放行: {exc}")
             return None
 
         envelope = MessageEnvelope(
@@ -575,6 +578,92 @@ class DebounceRuntime:
     def _debug_chat_key(self, chat_key: str) -> str:
         return f"{chat_key[:4]}...{chat_key[-4:]}" if len(chat_key) > 8 else chat_key
 
+    @staticmethod
+    def _is_group_message(message: Any) -> bool:
+        chat_type = getattr(message, "chat_type", "")
+        chat_type = str(getattr(chat_type, "value", chat_type)).lower()
+        return chat_type == "group"
+
+    @staticmethod
+    def _shadow_trigger_match(message: Any, preset_name: str = "") -> tuple[bool, str]:
+        """按核心的显式触发语义计算消息是否具备启动资格。"""
+
+        if bool(getattr(message, "is_tome", False)):
+            return True, "is_tome"
+        content = str(getattr(message, "content_text", "") or "")
+        name = preset_name.strip()
+        if name and name in content:
+            return True, "preset_name"
+        return False, "none"
+
+    async def _trigger_match(self, ctx: Any, message: Any) -> tuple[bool, str]:
+        """读取当前人设名称，计算与核心一致的消息触发资格。"""
+
+        if bool(getattr(message, "is_tome", False)):
+            return True, "is_tome"
+        current_preset = getattr(ctx, "current_preset", None)
+        if not callable(current_preset):
+            return False, "preset_unavailable"
+        try:
+            preset = current_preset()
+            if hasattr(preset, "__await__"):
+                preset = await preset
+            preset_name = str(getattr(preset, "name", "") or "")
+        except Exception:
+            return False, "preset_unavailable"
+        return self._shadow_trigger_match(message, preset_name)
+
+    @staticmethod
+    def _shadow_sender_label(message: Any) -> str:
+        sender = sender_bucket(message)
+        return hashlib.sha256(sender.encode("utf-8")).hexdigest()[:10] if sender else "unknown"
+
+    async def _observe_trigger_scope(
+        self,
+        ctx: Any,
+        message: Any,
+        current_buffer: ChatBuffer | None,
+        trigger_match: bool | None = None,
+        trigger_source: str | None = None,
+    ) -> None:
+        """记录候选门控结果；此方法不得改变消息、缓冲或返回信号。"""
+
+        if not getattr(self.config, "observe_trigger_scope", False):
+            return
+        try:
+            if trigger_match is None or trigger_source is None:
+                matched, source = await self._trigger_match(ctx, message)
+            else:
+                matched, source = trigger_match, trigger_source
+            chat_key = str(getattr(message, "chat_key", "") or "")
+            sender = sender_bucket(message)
+            pending = self.buffers.for_chat(chat_key)
+            same_sender = current_buffer is not None and current_buffer.sender_bucket == sender
+            other_senders = {
+                buffer.sender_bucket
+                for buffer in pending
+                if buffer.sender_bucket and buffer.sender_bucket != sender
+            }
+            decision = "same_sender_continuation" if same_sender else (
+                "new_trigger_batch" if matched else "background_or_untriggered"
+            )
+            if self._is_group_message(message) and not same_sender and not matched:
+                behavior = "continued_to_core"
+            elif same_sender or matched:
+                behavior = "debounce_batch"
+            else:
+                behavior = "private_debounce_batch"
+            self.logger.info(
+                f"[Debounce][Observe] chat={self._debug_chat_key(chat_key)} "
+                f"sender={self._shadow_sender_label(message)} "
+                f"trigger_match={matched} source={source} "
+                f"current_sender_batch={same_sender} pending_batches={len(pending)} "
+                f"other_sender_pending={len(other_senders)} "
+                f"decision={decision} behavior={behavior}",
+            )
+        except Exception as exc:
+            self.logger.warning(f"[Debounce][Observe] 触发范围观测失败，已忽略：{type(exc).__name__}")
+
     async def _get_release_channel(self, chat_key: str) -> Any:
         """通过 Nekro 公共模型 API 读取释放前的频道状态。"""
 
@@ -699,7 +788,7 @@ class DebounceRuntime:
         taken = self.buffers.take(current.buffer_key, current.generation)
         return taken
 
-    async def _merge_and_trigger(self, message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
+    async def _merge_and_trigger(self, _message: Any, buffer: ChatBuffer, reason: str) -> MsgSignal:
         try:
             released = await self._release_gate(buffer, reason)
         except JournalError as exc:
@@ -708,20 +797,14 @@ class DebounceRuntime:
         if released is None:
             return MsgSignal.CONTINUE
         try:
-            merge_into_message(message, released.messages)
-        except Exception as exc:
-            self.logger.exception(f"[Debounce] 消息合并失败，当前消息 fail-open，pending 保留: {exc}")
-            try:
-                await self.journal.mark_manual_recovery(released.record_ids, f"merge_failed:{reason}")
-            except JournalError as journal_exc:
-                self.logger.exception(f"[Debounce] 合并失败批次无法标记人工恢复: {journal_exc}")
-            return MsgSignal.CONTINUE
-        try:
-            await self.journal.mark_manual_recovery(released.record_ids, f"outer_persist_unconfirmed:{reason}")
+            await self.journal.acknowledge(released.record_ids)
         except JournalError as exc:
-            self.logger.exception(f"[Debounce] 合并后更新 journal 失败，保留原记录: {exc}")
+            self.logger.exception(f"[Debounce] 媒体边界已释放，但 journal 清理失败: {exc}")
         if self.config.debug_logging:
-            self.logger.info(f"[Debounce] release_reason={reason} text_length={len(getattr(message, 'content_text', '') or '')}")
+            self.logger.info(
+                f"[Debounce] release_reason={reason} dispatch=core_current_message "
+                f"pending_messages={len(released.messages)}",
+            )
         return MsgSignal.FORCE_TRIGGER
 
     async def _on_timeout(self, internal_key: str, generation: int) -> None:
@@ -796,11 +879,11 @@ class DebounceRuntime:
             return
         record_ids = taken.record_ids
         try:
-            await self._replay_as_human_message(taken)
+            await self._schedule_agent_from_history(taken)
         except Exception as exc:
-            self.logger.exception(f"[Debounce] timeout 用户消息重放失败，保留人工恢复记录: {exc}")
+            self.logger.exception(f"[Debounce] timeout 历史调度失败，保留人工恢复记录: {exc}")
             try:
-                await self.journal.mark_manual_recovery(record_ids, f"timeout_human_replay_failed:{reason}")
+                await self.journal.mark_manual_recovery(record_ids, f"history_dispatch_failed:{reason}")
             except JournalError:
                 pass
             return
@@ -808,42 +891,23 @@ class DebounceRuntime:
         try:
             await self.journal.acknowledge(record_ids)
         except JournalError as exc:
-            self.logger.exception(f"[Debounce] timeout 已调用但 journal 清理失败: {exc}")
+            self.logger.exception(f"[Debounce] timeout 已调度但 journal 清理失败: {exc}")
         if self.config.debug_logging:
-            self.logger.info(f"[Debounce] release_reason={reason} text_length={len(taken.text)}")
+            self.logger.info(
+                f"[Debounce] release_reason={reason} dispatch=history "
+                f"pending_messages={len(taken.messages)}",
+            )
 
-    async def _replay_as_human_message(self, buffer: ChatBuffer) -> None:
-        """将超时缓冲重新交给用户消息入口，避免生成 SYSTEM 消息。"""
+    async def _schedule_agent_from_history(self, buffer: ChatBuffer) -> None:
+        """调度 Agent 读取已落库的原始消息，不构造合成用户消息。"""
 
-        from nekro_agent.schemas.chat_message import ChatMessage, ChatType
+        from nekro_agent.schemas.agent_ctx import AgentCtx
         from nekro_agent.services.message_service import message_service
 
-        channel = await self._get_release_channel(buffer.chat_key)
-        last_message = buffer.messages[-1]
-        content_text, content_data = merge_message_content(
-            [(item.text, item.content_data) for item in buffer.messages],
-        )
-        message = ChatMessage(
-            message_id=f"debounce-{buffer.generation}-{last_message.message_id or last_message.event_id}",
-            sender_id=last_message.sender_id or "0",
-            sender_name=last_message.sender_name or "未知用户",
-            sender_nickname=last_message.sender_nickname or last_message.sender_name or "未知用户",
-            adapter_key=last_message.adapter_key or channel.adapter_key,
-            platform_userid=last_message.platform_userid or "0",
-            is_tome=0,
-            is_recalled=False,
+        ctx = await AgentCtx.create_by_chat_key(chat_key=buffer.chat_key)
+        await message_service.schedule_agent_task(
             chat_key=buffer.chat_key,
-            chat_type=ChatType(channel.chat_type),
-            content_text=content_text,
-            content_data=restore_segments(content_data),
-            raw_cq_code=last_message.raw_cq_code,
-            ext_data={REPLAY_MARKER: True},
-            send_timestamp=int(time.time()),
-        )
-        await message_service.push_human_message(
-            message=message,
-            trigger_agent=True,
-            db_chat_channel=channel,
+            ctx=ctx,
         )
 
 

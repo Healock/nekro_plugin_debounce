@@ -1,13 +1,13 @@
 # NekroAgent 消息防抖
 
-版本：`0.4.3`
+版本：`0.5.1`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
 - 原作者：`advent259141`
 - 原仓库：[advent259141/astrbot_plugin_debounce](https://github.com/advent259141/astrbot_plugin_debounce)
 
-连续发送的文本先按频道缓冲。插件同时观察累计文本的语义完整性和最后一条消息后的静默时间：静默窗口结束且语义完整时触发；语义持续不完整时最多等待到硬上限，再强制触发一次。
+连续发送的消息先按频道和发送者建立批次。插件只控制 Agent 是否触发，不合成、不重放用户消息：每条原始消息都会由 Nekro 核心正常写入历史，静默窗口结束后由 Agent 从频道历史读取上下文。插件同时观察累计文本的语义完整性和静默时间；语义持续不完整时最多等待到硬上限，再强制触发一次。
 
 ## 兼容配置
 
@@ -25,8 +25,11 @@
 | `max_wait_seconds` | `60` | 从第一条消息开始计算的最大等待时间，单位为秒 |
 | `enabled` | `true` | 是否启用 |
 | `usage_scope` | `both` | `both`、`group`、`private` |
-| `cancel_on_new_message` | `true` | 字段保留；Nekro v0.4.0 不取消运行中的 Agent |
+| `cancel_on_new_message` | `true` | 字段保留；当前 Nekro 不取消运行中的 Agent |
 | `debug_logging` | `false` | 开启后在日志中记录概率变化、阈值、等待窗口和释放原因 |
+| `observe_trigger_scope` | `false` | 记录实际触发资格、发送者批次归属和跨发送者 pending 情况 |
+
+`observe_trigger_scope` 只控制详细观测日志，不控制门控本身。群聊中，消息必须满足 `is_tome` 或当前人设名称匹配，才能创建新的防抖批次；未触发的首条普通消息会继续由核心正常入库，不会被防抖插件阻止。同一发送者已有 pending 批次时，其后续文本可以继续追加。`same_sender_continuation` 表示追加到已有批次，`new_trigger_batch` 表示消息具备新批次启动资格，`background_or_untriggered` 表示消息未满足触发条件。日志不记录完整消息文本。
 
 每条文本消息都会基于当前频道的累计文本重新分类。第一条消息始终使用普通静默窗口；后续消息只有在达到 `high_confidence_threshold` 时才进入高置信度等待，其余情况使用普通窗口。高置信度等待会参考本批最近最多 3 个消息间隔，按 `max(high_confidence_timeout_seconds, 最大近期间隔 × cadence_multiplier + cadence_margin_seconds)` 计算，并且不超过普通静默窗口和最大等待期限。缺少可用时间记录时使用配置的最短高置信度等待。静默结束时会重新分类，概率下降时恢复普通等待，直到语义完整或达到 `max_wait_seconds` 后强制触发。模型加载或推理失败时，当前批次退化为普通时间防抖。
 
@@ -45,15 +48,15 @@
 ## 消息边界
 
 - `mount_on_user_message` 能看到的命令、`is_tome` 和显式 @ 不会在插件内额外绕过；上游已经消费、没有进入回调的命令不由本插件处理。
-- 群聊按“频道 + 发送者”分别缓冲，不同发送者的消息不会合并到同一条 Agent 输入中；同一发送者的连续消息仍按原策略合并。私聊按用户频道独立缓冲。
+- 群聊按“频道 + 发送者”分别维护防抖批次，不同发送者不会进入同一批次；同一发送者的连续消息仍按原策略累计分类。释放时 Agent 读取频道历史，因此其他消息仍可能作为上下文，但插件不会把它们伪造成触发者的合成消息。私聊按用户频道独立缓冲。
 - 已有 pending 文本时，下一条可分类文本会合并到累计文本并再次运行完整性分类器。
-- 纯文本和 AT 可进入分类器。图片、语音、视频、文件、Forward、卡片、戳一戳等非文本段是硬边界：没有 pending 时原样放行，有 pending 时按顺序合并到当前 `ChatMessage`，保留 `content_data` 并直接触发。
+- 纯文本和 AT 可进入分类器。图片、语音、视频、文件、Forward、卡片、戳一戳等非文本段是硬边界：没有 pending 时原样放行，有 pending 时释放旧文本批次并让当前媒体消息按原样落库、直接触发，不修改当前消息内容。
 
 ## Journal 与故障处理
 
-默认使用 `plugin.store` 保存 JSON journal。返回 `BLOCK_ALL` 前必须成功写入；存储、模型或合并失败时 fail-open。journal 已写入但 timeout 任务创建失败时保留 `pending` 记录，等待下次消息或启动恢复。timeout 状态写入失败时保留内存缓冲并进行有限重试，超过上限后转人工恢复。启动时恢复 `pending` 记录，`flushing` 与不确定状态标记为人工恢复，禁止自动重复触发。合并失败的批次也会标记为人工恢复，不会留下可自动重放的 `pending` 状态。
+默认使用 `plugin.store` 保存 JSON journal。返回 `BLOCK_TRIGGER` 前必须成功写入；存储、模型或调度失败时 fail-open 或转人工恢复。journal 已写入但 timeout 任务创建失败时保留 `pending` 记录，等待下次消息或启动恢复。timeout 状态写入失败时保留内存缓冲并进行有限重试，超过上限后转人工恢复。启动时恢复 `pending` 记录，`flushing` 与不确定状态标记为人工恢复，禁止自动重复触发。释放成功后只确认 journal，不改写已经由核心保存的原始消息。
 
-Nekro 公共 API 没有当前用户消息的 after-persist 回调，因此完整消息路径在合并后保留 `MANUAL_RECOVERY` 记录；状态写入失败时不能声称外层消息已经完成持久化确认。记录可能长期增长，需要后续人工清理或回收。v0.4.0 不承诺 exactly-once。超时文本会通过 Nekro 当前的用户消息处理入口重新提交，避免把用户内容写成 `SYSTEM` 消息；该路径依赖 Nekro 内部消息服务，调用异常视为不确定状态，不自动重试。
+插件不依赖 after-persist 回调，也不伪造用户消息。超时释放调用 Nekro 当前的 `message_service.schedule_agent_task`，让 Agent 从已落库的频道历史读取上下文；这是当前 Nekro 内部服务接口，升级 Nekro 时需要重新核对。调度调用异常视为不确定状态，不自动重复触发。v0.5.0 不承诺 exactly-once，但不会因为防抖而改变原始消息的发送者、消息 ID 或历史内容。
 
 ## 模型与依赖
 
@@ -74,9 +77,12 @@ ONNX Runtime、Transformers、NumPy 和 ModelScope 在插件初始化阶段开�
 `nekro_plugin_debounce.invalidate_channel(chat_key, reason)`，该入口是幂等的，
 不会让调度器对防抖插件形成硬依赖。
 
+Schedule 通过已加载插件实例上的 `debounce_bridge` 能力调用频道失效，不依赖插件源码的
+Python 导入路径。该能力版本为 `1`；没有 pending 批次也会返回已确认结果。
+
 ## Nekro API 差异
 
-Nekro v0.4.2 不实现 AstrBot 的 ProviderRequest 改写、通用用户消息伪造、运行中 Agent 取消、旧回复丢弃和媒体消息重放。超时重放仅用于恢复本插件自己阻塞的文本批次；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。
+当前 Nekro 不实现 AstrBot 的 ProviderRequest 改写、运行中 Agent 取消和旧回复丢弃。v0.5.1 不再使用通用用户消息伪造或超时重放；`cancel_on_new_message` 仅为配置兼容字段，不代表已提供取消能力。插件使用当前 Nekro 内部的历史调度接口，升级时需复核接口兼容性。
 
 ## 验证边界
 

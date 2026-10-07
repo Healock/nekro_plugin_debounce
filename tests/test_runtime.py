@@ -21,6 +21,7 @@ class Message:
     sender_id: str = "u1"
     sender_name: str = "User"
     sender_nickname: str = "User"
+    is_tome: int = 0
     content_text: str = ""
     content_data: list[dict] = field(default_factory=list)
 
@@ -38,7 +39,21 @@ def test_config_uses_hybrid_defaults() -> None:
     assert config.usage_scope == "both"
     assert config.cancel_on_new_message is True
     assert config.debug_logging is False
+    assert config.observe_trigger_scope is False
     assert "debounce_mode" not in DebounceConfig.model_fields
+
+
+def test_shadow_trigger_match_uses_core_trigger_semantics() -> None:
+    from nekro_plugin_debounce import plugin
+    from nekro_plugin_debounce.lifecycle import DebounceRuntime
+
+    runtime = DebounceRuntime(plugin, DebounceConfig())
+    assert runtime._shadow_trigger_match(Message(content_text="你好", is_tome=1)) == (True, "is_tome")
+    assert runtime._shadow_trigger_match(Message(content_text="你好绵绵", is_tome=0), "绵绵") == (
+        True,
+        "preset_name",
+    )
+    assert runtime._shadow_trigger_match(Message(content_text="普通群聊", is_tome=0), "绵绵") == (False, "none")
 
 
 def test_config_rejects_max_wait_shorter_than_quiet_window() -> None:
@@ -80,10 +95,10 @@ async def test_complete_message_waits_for_quiet_window() -> None:
     runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, high_confidence_timeout_seconds=1, max_wait_seconds=5))
     runtime.classifier.classify = lambda *_args: _result(True)  # type: ignore[method-assign]
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda buffer: _capture(buffer, replayed)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda buffer: _capture(buffer, replayed)  # type: ignore[method-assign]
 
     message = Message(message_id="complete-1", content_text="完整句子", content_data=[{"type": "text", "text": "完整句子"}])
-    assert (await runtime.handle_user_message(None, message)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, message)).name == "BLOCK_TRIGGER"
     assert runtime.buffers.has_pending("chat")
     assert not replayed
 
@@ -112,8 +127,8 @@ async def test_each_message_reclassifies_accumulated_text() -> None:
     runtime.classifier.classify = classify  # type: ignore[method-assign]
     first = Message(message_id="acc-1", content_text="第一段", content_data=[{"type": "text", "text": "第一段"}])
     second = Message(message_id="acc-2", content_text="第二段", content_data=[{"type": "text", "text": "第二段"}])
-    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
-    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_TRIGGER"
+    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_TRIGGER"
     assert inputs == ["第一段", "第一段 第二段"]
     await runtime.stop()
 
@@ -133,12 +148,13 @@ async def test_group_messages_from_different_senders_use_separate_buffers() -> N
     async def capture(buffer) -> None:
         replayed.append((buffer.sender_bucket, buffer.text))
 
-    runtime._replay_as_human_message = capture  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = capture  # type: ignore[method-assign]
     first = Message(
         chat_key="group",
         chat_type="group",
         sender_id="user-a",
         message_id="a-1",
+        is_tome=1,
         content_text="用户 A 的消息",
         content_data=[{"type": "text", "text": "用户 A 的消息"}],
     )
@@ -147,12 +163,13 @@ async def test_group_messages_from_different_senders_use_separate_buffers() -> N
         chat_type="group",
         sender_id="user-b",
         message_id="b-1",
+        is_tome=1,
         content_text="用户 B 的消息",
         content_data=[{"type": "text", "text": "用户 B 的消息"}],
     )
 
-    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
-    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_TRIGGER"
+    assert (await runtime.handle_user_message(None, second)).name == "BLOCK_TRIGGER"
     assert len(runtime.buffers.for_chat("group")) == 2
 
     for buffer in runtime.buffers.for_chat("group"):
@@ -161,6 +178,59 @@ async def test_group_messages_from_different_senders_use_separate_buffers() -> N
         await runtime._on_timeout(buffer.buffer_key, buffer.generation)
 
     assert sorted(replayed) == [("user-a", "用户 A 的消息"), ("user-b", "用户 B 的消息")]
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_untriggered_group_message_passes_without_creating_buffer() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    message = Message(
+        chat_key="group",
+        chat_type="group",
+        message_id="background-1",
+        content_text="群里的普通消息",
+        content_data=[{"type": "text", "text": "群里的普通消息"}],
+    )
+
+    assert (await runtime.handle_user_message(None, message)).name == "CONTINUE"
+    assert not runtime.buffers.for_chat("group")
+    assert await runtime.journal.records() == []
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_triggered_group_message_starts_batch_and_same_sender_continues() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
+    first = Message(
+        chat_key="group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="trigger-1",
+        is_tome=1,
+        content_text="@Bot 请回答",
+        content_data=[{"type": "text", "text": "@Bot 请回答"}],
+    )
+    continuation = Message(
+        chat_key="group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="trigger-2",
+        content_text="这是补充说明",
+        content_data=[{"type": "text", "text": "这是补充说明"}],
+    )
+
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_TRIGGER"
+    assert (await runtime.handle_user_message(None, continuation)).name == "BLOCK_TRIGGER"
+    buffer = runtime.buffers.get("group\x1fuser-a")
+    assert buffer is not None
+    assert buffer.text == "@Bot 请回答 这是补充说明"
     await runtime.stop()
 
 
@@ -356,7 +426,7 @@ async def test_incomplete_timeout_waits_then_max_wait_forces_release() -> None:
     runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, high_confidence_timeout_seconds=1, max_wait_seconds=5))
     runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda buffer: _capture(buffer, replayed)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda buffer: _capture(buffer, replayed)  # type: ignore[method-assign]
     message = Message(message_id="wait-1", content_text="未完成", content_data=[{"type": "text", "text": "未完成"}])
     await runtime.handle_user_message(None, message)
     buffer = runtime.buffers.get("chat")
@@ -416,9 +486,9 @@ async def test_classifier_failure_falls_back_to_quiet_window() -> None:
 
     runtime.classifier.classify = fail  # type: ignore[method-assign]
     replayed: list[str] = []
-    runtime._replay_as_human_message = lambda buffer: _capture(buffer, replayed)  # type: ignore[method-assign]
+    runtime._schedule_agent_from_history = lambda buffer: _capture(buffer, replayed)  # type: ignore[method-assign]
     message = Message(message_id="fallback-1", content_text="降级", content_data=[{"type": "text", "text": "降级"}])
-    assert (await runtime.handle_user_message(None, message)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, message)).name == "BLOCK_TRIGGER"
     buffer = runtime.buffers.get("chat")
     assert buffer is not None and buffer.classifier_fallback
     buffer.quiet_deadline = time.time() - 1
@@ -428,18 +498,18 @@ async def test_classifier_failure_falls_back_to_quiet_window() -> None:
 
 
 @pytest.mark.asyncio
-async def test_media_boundary_merges_without_classifier() -> None:
+async def test_media_boundary_releases_without_modifying_current_message() -> None:
     from nekro_plugin_debounce import plugin
 
     plugin.store.data.clear()
     runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, high_confidence_timeout_seconds=1, max_wait_seconds=5))
     runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
     first = Message(message_id="media-1", content_text="先说", content_data=[{"type": "text", "text": "先说"}])
-    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_ALL"
+    assert (await runtime.handle_user_message(None, first)).name == "BLOCK_TRIGGER"
     media = Message(message_id="media-2", content_text="图片", content_data=[{"type": "image", "text": "[图片]"}])
     assert (await runtime.handle_user_message(None, media)).name == "FORCE_TRIGGER"
-    assert media.content_text == "先说 图片"
-    assert [item["type"] for item in media.content_data] == ["text", "image"]
+    assert media.content_text == "图片"
+    assert [item["type"] for item in media.content_data] == ["image"]
     await runtime.stop()
 
 

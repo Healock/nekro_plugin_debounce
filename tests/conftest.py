@@ -149,10 +149,23 @@ def pytest_configure() -> None:
     chat_message.ChatType = ChatType
     services = types.ModuleType("nekro_agent.services")
     services.__path__ = []  # type: ignore[attr-defined]
+    schemas_agent_ctx = types.ModuleType("nekro_agent.schemas.agent_ctx")
+
+    class AgentCtx:
+        @classmethod
+        async def create_by_chat_key(cls, *, chat_key: str, **_kwargs: Any) -> "AgentCtx":
+            instance = cls()
+            instance.chat_key = chat_key
+            return instance
+
+    schemas_agent_ctx.AgentCtx = AgentCtx
     message_service_module = types.ModuleType("nekro_agent.services.message_service")
 
     class _MessageService:
         async def push_human_message(self, **_kwargs: Any) -> None:
+            return None
+
+        async def schedule_agent_task(self, **_kwargs: Any) -> None:
             return None
 
     message_service_module.message_service = _MessageService()
@@ -166,6 +179,7 @@ def pytest_configure() -> None:
             "nekro_agent.models": models,
             "nekro_agent.models.db_chat_channel": db_chat_channel,
             "nekro_agent.schemas.chat_message": chat_message,
+            "nekro_agent.schemas.agent_ctx": schemas_agent_ctx,
             "nekro_agent.services": services,
             "nekro_agent.services.message_service": message_service_module,
         },
