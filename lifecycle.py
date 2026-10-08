@@ -899,15 +899,25 @@ class DebounceRuntime:
             )
 
     async def _schedule_agent_from_history(self, buffer: ChatBuffer) -> None:
-        """调度 Agent 读取已落库的原始消息，不构造合成用户消息。"""
+        """调度 Agent 读取原始历史，并传递冻结的触发者审计快照。"""
 
         from nekro_agent.schemas.agent_ctx import AgentCtx
+        from nekro_agent.schemas.trigger_audit import TriggerAuditContext, TriggerAuditSource
         from nekro_agent.services.message_service import message_service
 
         ctx = await AgentCtx.create_by_chat_key(chat_key=buffer.chat_key)
+        latest_message = buffer.messages[-1]
+        trigger_audit = TriggerAuditContext(
+            source=TriggerAuditSource.DEBOUNCE_RELEASE,
+            message_id=latest_message.message_id or None,
+            sender_id=latest_message.sender_id or None,
+            sender_name=latest_message.sender_name or None,
+            generation=buffer.generation,
+        )
         await message_service.schedule_agent_task(
             chat_key=buffer.chat_key,
             ctx=ctx,
+            trigger_audit=trigger_audit,
         )
 
 

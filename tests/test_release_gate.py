@@ -248,4 +248,10 @@ async def test_timeout_dispatches_history_without_constructing_user_message() ->
     assert len(captured) == 1
     assert captured[0]["chat_key"] == "gate-chat"
     assert isinstance(captured[0]["ctx"], _Ctx)
+    assert captured[0]["trigger_audit"].source.value == "debounce_release"
+    assert captured[0]["trigger_audit"].message_id == "raw-1"
+    assert captured[0]["trigger_audit"].sender_id == "u1"
+    assert captured[0]["trigger_audit"].sender_name == "User"
+    assert captured[0]["trigger_audit"].generation == 2
+    assert "message" not in captured[0]
     await runtime.stop()

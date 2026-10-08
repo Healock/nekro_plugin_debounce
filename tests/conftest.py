@@ -159,6 +159,21 @@ def pytest_configure() -> None:
             return instance
 
     schemas_agent_ctx.AgentCtx = AgentCtx
+    schemas_trigger_audit = types.ModuleType("nekro_agent.schemas.trigger_audit")
+
+    class TriggerAuditSource(Enum):
+        DEBOUNCE_RELEASE = "debounce_release"
+
+    @dataclass(frozen=True)
+    class TriggerAuditContext:
+        source: TriggerAuditSource
+        message_id: str | None = None
+        sender_id: str | None = None
+        sender_name: str | None = None
+        generation: int | None = None
+
+    schemas_trigger_audit.TriggerAuditContext = TriggerAuditContext
+    schemas_trigger_audit.TriggerAuditSource = TriggerAuditSource
     message_service_module = types.ModuleType("nekro_agent.services.message_service")
 
     class _MessageService:
@@ -180,6 +195,7 @@ def pytest_configure() -> None:
             "nekro_agent.models.db_chat_channel": db_chat_channel,
             "nekro_agent.schemas.chat_message": chat_message,
             "nekro_agent.schemas.agent_ctx": schemas_agent_ctx,
+            "nekro_agent.schemas.trigger_audit": schemas_trigger_audit,
             "nekro_agent.services": services,
             "nekro_agent.services.message_service": message_service_module,
         },
