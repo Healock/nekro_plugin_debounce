@@ -899,14 +899,35 @@ class DebounceRuntime:
             )
 
     async def _schedule_agent_from_history(self, buffer: ChatBuffer) -> None:
-        """调度 Agent 读取已落库的原始消息，不构造合成用户消息。"""
+        """从已落库历史调度 Agent，并保留原始触发消息的执行上下文。"""
 
+        from nekro_agent.models.db_chat_channel import DBChatChannel
         from nekro_agent.schemas.agent_ctx import AgentCtx
+        from nekro_agent.schemas.chat_message import ChatMessage, ChatType, segments_from_list
         from nekro_agent.services.message_service import message_service
 
+        channel = await DBChatChannel.get_channel(chat_key=buffer.chat_key)
+        last_message = buffer.messages[-1]
+        message = ChatMessage(
+            message_id=last_message.message_id,
+            sender_id=last_message.sender_id or "0",
+            sender_name=last_message.sender_name or "未知用户",
+            sender_nickname=last_message.sender_nickname or last_message.sender_name or "未知用户",
+            adapter_key=last_message.adapter_key or channel.adapter_key,
+            platform_userid=last_message.platform_userid or "0",
+            is_tome=1,
+            is_recalled=False,
+            chat_key=buffer.chat_key,
+            chat_type=ChatType(channel.chat_type),
+            content_text=last_message.text,
+            content_data=segments_from_list(last_message.content_data),
+            raw_cq_code=last_message.raw_cq_code,
+            ext_data={},
+            send_timestamp=int(last_message.received_at or time.time()),
+        )
         ctx = await AgentCtx.create_by_chat_key(chat_key=buffer.chat_key)
         await message_service.schedule_agent_task(
-            chat_key=buffer.chat_key,
+            message=message,
             ctx=ctx,
         )
 
