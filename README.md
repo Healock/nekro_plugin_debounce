@@ -56,7 +56,7 @@
 
 默认使用 `plugin.store` 保存 JSON journal。返回 `BLOCK_TRIGGER` 前必须成功写入；存储、模型或调度失败时 fail-open 或转人工恢复。journal 已写入但 timeout 任务创建失败时保留 `pending` 记录，等待下次消息或启动恢复。timeout 状态写入失败时保留内存缓冲并进行有限重试，超过上限后转人工恢复。启动时恢复 `pending` 记录，`flushing` 与不确定状态标记为人工恢复，禁止自动重复触发。释放成功后只确认 journal，不改写已经由核心保存的原始消息。
 
-插件不依赖 after-persist 回调，也不伪造用户消息。超时释放调用 Nekro 当前的 `message_service.schedule_agent_task`，让 Agent 从已落库的频道历史读取上下文；这是当前 Nekro 内部服务接口，升级 Nekro 时需要重新核对。调度调用异常视为不确定状态，不自动重复触发。v0.5.0 不承诺 exactly-once，但不会因为防抖而改变原始消息的发送者、消息 ID 或历史内容。
+插件不依赖 after-persist 回调，也不通过 `push_human_message` 重放或再次持久化用户消息。超时释放调用 Nekro 当前的 `message_service.schedule_agent_task(message=...)`：传入与最后一条已落库消息一致的运行时消息对象，让旧版 Agent 沙盒能够记录触发用户；Agent 仍从已落库的频道历史读取完整上下文。该接口属于 Nekro 内部服务接口，升级 Nekro 时需要重新核对。调度调用异常视为不确定状态，不自动重复触发。v0.5.0 不承诺 exactly-once，但不会因为防抖而新增合成历史消息或改变原始消息的发送者、消息 ID 和内容。
 
 ## 模型与依赖
 

@@ -205,7 +205,7 @@ async def test_media_boundary_uses_the_same_channel_release_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timeout_dispatches_history_without_constructing_user_message() -> None:
+async def test_timeout_dispatches_history_with_original_sender_context() -> None:
     runtime, _channel_obj = await _ready_runtime()
     captured = []
 
@@ -246,6 +246,10 @@ async def test_timeout_dispatches_history_without_constructing_user_message() ->
     await runtime._schedule_agent_from_history(buffer)
 
     assert len(captured) == 1
-    assert captured[0]["chat_key"] == "gate-chat"
+    assert captured[0]["message"].message_id == "raw-1"
+    assert captured[0]["message"].sender_id == "u1"
+    assert captured[0]["message"].sender_name == "User"
+    assert captured[0]["message"].chat_key == "gate-chat"
+    assert captured[0]["message"].content_text == "raw"
     assert isinstance(captured[0]["ctx"], _Ctx)
     await runtime.stop()

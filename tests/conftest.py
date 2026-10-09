@@ -147,6 +147,7 @@ def pytest_configure() -> None:
 
     chat_message.ChatMessage = ChatMessage
     chat_message.ChatType = ChatType
+    chat_message.segments_from_list = lambda data: data
     services = types.ModuleType("nekro_agent.services")
     services.__path__ = []  # type: ignore[attr-defined]
     schemas_agent_ctx = types.ModuleType("nekro_agent.schemas.agent_ctx")
