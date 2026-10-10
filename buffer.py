@@ -164,6 +164,3 @@ class BufferManager:
 
     def for_chat(self, chat_key: str) -> list[ChatBuffer]:
         return [buffer for buffer in self._buffers.values() if buffer.chat_key == chat_key and buffer.messages]
-
-    def snapshot(self) -> dict[str, ChatBuffer]:
-        return dict(self._buffers)

@@ -92,8 +92,6 @@ def pytest_configure() -> None:
     schemas.__path__ = []  # type: ignore[attr-defined]
     signal = types.ModuleType("nekro_agent.schemas.signal")
 
-    from enum import Enum
-
     class MsgSignal(Enum):
         FORCE_TRIGGER = -1
         CONTINUE = 0

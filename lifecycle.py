@@ -40,8 +40,6 @@ class DebounceRuntime:
         self.classifier = ClassifierAdapter(
             model_type=config.model_type,
             data_dir=plugin.get_plugin_data_dir(),
-            logger=plugin.logger,
-            debug_logging=config.debug_logging,
         )
         self.tasks = TaskManager(self._on_timeout, logger=plugin.logger)
         self._started = False

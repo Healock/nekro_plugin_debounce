@@ -266,6 +266,7 @@ async def test_first_high_confidence_message_uses_normal_window() -> None:
         plugin,
         DebounceConfig(timeout_seconds=10, high_confidence_timeout_seconds=2, max_wait_seconds=60),
     )
+
     async def classify_high(*_args):
         from nekro_plugin_debounce.classifier import ClassificationResult
 
