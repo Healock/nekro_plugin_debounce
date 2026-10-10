@@ -8,6 +8,8 @@ from typing import Any
 
 
 SAFE_SEGMENT_TYPES = {"text", "at"}
+
+
 def segment_type_name(segment: Any) -> str:
     """返回稳定的消息段类型名称。"""
 

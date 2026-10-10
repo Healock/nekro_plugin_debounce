@@ -59,7 +59,3 @@ class TaskManager:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    @property
-    def tasks(self) -> dict[tuple[str, int], asyncio.Task[None]]:
-        return dict(self._tasks)

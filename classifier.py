@@ -39,8 +39,6 @@ def send_probability(logits: Any) -> float:
     maximum = max(values)
     exponentials = [math.exp(value - maximum) for value in values]
     total = sum(exponentials)
-    if total <= 0:
-        raise ValueError("完整性模型 logits 无法归一化")
     return exponentials[1] / total
 
 
@@ -51,7 +49,7 @@ class SentenceClassifier:
         try:
             from nekro_agent.api.plugin import dynamic_import_pkg
 
-            self._numpy = dynamic_import_pkg("numpy>=1.21.0", "numpy", repo_dir=package_dir)
+            dynamic_import_pkg("numpy>=1.21.0", "numpy", repo_dir=package_dir)
             ort = dynamic_import_pkg("onnxruntime>=1.15.0", "onnxruntime", repo_dir=package_dir)
             transformers = dynamic_import_pkg("transformers>=4.30.0", "transformers", repo_dir=package_dir)
         except Exception as exc:
@@ -92,12 +90,10 @@ class SentenceClassifier:
 class ClassifierAdapter:
     """管理模型目录、惰性依赖导入和线程池推理。"""
 
-    def __init__(self, model_type: str, data_dir: Path, logger: Any = None, debug_logging: bool = False) -> None:
+    def __init__(self, model_type: str, data_dir: Path) -> None:
         self.model_type = model_type if model_type in MODEL_REPOSITORIES else "small"
         self.data_dir = data_dir
         self.package_dir = data_dir / "packages"
-        self.logger = logger
-        self.debug_logging = debug_logging
         self._classifier: Optional[SentenceClassifier] = None
         self._load_lock = asyncio.Lock()
         self._load_error: ClassifierUnavailable | None = None
@@ -179,9 +175,6 @@ class ClassifierAdapter:
             shutil.copytree(source_tokenizer, target_dir / "tokenizer", dirs_exist_ok=True)
         except Exception as exc:
             raise ClassifierUnavailable(f"模型不存在且下载失败: {exc}") from exc
-
-    async def is_complete(self, text: str, threshold: float) -> bool:
-        return (await self.classify(text, threshold, threshold)).complete
 
     async def classify(self, text: str, threshold: float, high_threshold: float | None = None) -> ClassificationResult:
         classifier = await self._ensure_loaded()
