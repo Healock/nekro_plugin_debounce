@@ -369,6 +369,20 @@ async def test_reply_scope_prompt_respects_enabled_and_usage_scope() -> None:
     assert await runtime.render_reply_scope_prompt(context) == ""
     await runtime.stop()
 
+    runtime = DebounceRuntime(plugin, DebounceConfig(usage_scope="group"))
+    runtime.reply_scopes.begin(
+        chat_key="scope-config",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="scope-config-3",
+        sender_id="user-a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    prompt = await runtime.render_reply_scope_prompt(context)
+    assert '"sender_id":"user-a"' in prompt
+    await runtime.stop()
+
     runtime = DebounceRuntime(plugin, DebounceConfig(usage_scope="private"))
     runtime.reply_scopes.begin(
         chat_key="scope-config",
@@ -381,6 +395,26 @@ async def test_reply_scope_prompt_respects_enabled_and_usage_scope() -> None:
     )
     assert await runtime.render_reply_scope_prompt(context) == ""
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_registered_reply_scope_prompt_fails_safe_on_exception() -> None:
+    import nekro_plugin_debounce as debounce_module
+
+    from nekro_plugin_debounce import plugin
+
+    original = debounce_module.runtime.render_reply_scope_prompt
+
+    async def fail(_ctx):
+        raise RuntimeError("prompt failure")
+
+    debounce_module.runtime.render_reply_scope_prompt = fail  # type: ignore[method-assign]
+    try:
+        prompt = await plugin.prompt_inject_method(type("Ctx", (), {"chat_key": "scope-error"})())
+    finally:
+        debounce_module.runtime.render_reply_scope_prompt = original  # type: ignore[method-assign]
+
+    assert '"state":"missing"' in prompt
 
 
 @pytest.mark.asyncio

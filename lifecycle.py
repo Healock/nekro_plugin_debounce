@@ -799,7 +799,7 @@ class DebounceRuntime:
             trigger_source="restored_batch",
             message_id=first_message.message_id,
             sender_id=first_message.sender_id,
-            sender_name=first_message.sender_name or first_message.sender_nickname,
+            sender_name=self._sender_display_name(first_message),
             platform_userid=first_message.platform_userid,
         )
         await self.journal.update_batch(record_ids, release_reason=reason)
@@ -928,9 +928,7 @@ class DebounceRuntime:
     ) -> None:
         """只为合法触发消息或其同发送者续写建立回复范围。"""
 
-        is_private = not self._is_group_message(message)
-        is_continuation = previous_buffer is not None and previous_buffer.sender_bucket == buffer.sender_bucket
-        if not is_private and not trigger_match and not is_continuation:
+        if self._is_group_message(message) and not trigger_match and previous_buffer is None:
             return
         # 没有任何旧 pending 批次时，新的合法触发代表新的回合；不能把
         # 上一回合仍在 TTL 内的目标误判成跨发送者并发歧义。
@@ -945,7 +943,7 @@ class DebounceRuntime:
             trigger_source=source,
             message_id=buffer.messages[0].message_id,
             sender_id=buffer.messages[0].sender_id,
-            sender_name=buffer.messages[0].sender_name or buffer.messages[0].sender_nickname,
+            sender_name=self._sender_display_name(buffer.messages[0]),
             platform_userid=buffer.messages[0].platform_userid,
         )
         if scope.state == "ambiguous":
@@ -976,6 +974,14 @@ class DebounceRuntime:
             )
         return self.reply_scopes.render(chat_key)
 
+    @staticmethod
+    def _sender_display_name(message: Any, fallback: str = "") -> str:
+        return str(
+            getattr(message, "sender_name", "")
+            or getattr(message, "sender_nickname", "")
+            or fallback
+        )
+
     def _scope_allowed_for_context(self, ctx: Any) -> bool:
         """让提示注入遵守插件自身的启用状态和使用范围。"""
 
@@ -999,11 +1005,12 @@ class DebounceRuntime:
 
         channel = await DBChatChannel.get_channel(chat_key=buffer.chat_key)
         last_message = buffer.messages[-1]
+        display_name = self._sender_display_name(last_message, "未知用户")
         message = ChatMessage(
             message_id=last_message.message_id,
             sender_id=last_message.sender_id or "0",
-            sender_name=last_message.sender_name or "未知用户",
-            sender_nickname=last_message.sender_nickname or last_message.sender_name or "未知用户",
+            sender_name=display_name,
+            sender_nickname=display_name,
             adapter_key=last_message.adapter_key or channel.adapter_key,
             platform_userid=last_message.platform_userid or "0",
             is_tome=1,

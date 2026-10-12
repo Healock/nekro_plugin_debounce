@@ -163,4 +163,4 @@ class ReplyScopeStore:
         return f"[Debounce reply scope]\n{encoded}\n{guidance}"
 
 
-__all__ = ["ReplyScope", "ReplyScopeState", "ReplyScopeStore", "SCOPE_TTL_SECONDS"]
+__all__ = ["SCOPE_TTL_SECONDS", "ReplyScope", "ReplyScopeState", "ReplyScopeStore"]

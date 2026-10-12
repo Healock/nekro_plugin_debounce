@@ -50,6 +50,7 @@ class _Plugin:
         self.logger = _Logger()
         self.store = _Store()
         self._data_dir = Path(tempfile.mkdtemp(prefix="debounce-test-"))
+        self.prompt_inject_method = None
 
     def mount_config(self):
         return lambda cls: cls
@@ -70,7 +71,11 @@ class _Plugin:
         return lambda func: func
 
     def mount_prompt_inject_method(self, **_kwargs: Any):
-        return lambda func: func
+        def decorator(func):
+            self.prompt_inject_method = func
+            return func
+
+        return decorator
 
     def get_plugin_data_dir(self) -> Path:
         return self._data_dir
