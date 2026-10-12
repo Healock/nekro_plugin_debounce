@@ -235,6 +235,189 @@ async def test_triggered_group_message_starts_batch_and_same_sender_continues() 
 
 
 @pytest.mark.asyncio
+async def test_reply_scope_ignores_background_sender_and_preserves_trigger_sender() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
+
+    class Context:
+        async def current_preset(self):
+            return type("Preset", (), {"name": "Bot"})()
+
+    trigger = Message(
+        chat_key="group-scope",
+        chat_type="group",
+        sender_id="user-a",
+        sender_name="A",
+        message_id="scope-a",
+        is_tome=1,
+        content_text="@Bot 请看",
+        content_data=[{"type": "text", "text": "@Bot 请看"}],
+    )
+    background = Message(
+        chat_key="group-scope",
+        chat_type="group",
+        sender_id="user-b",
+        sender_name="B",
+        message_id="scope-b",
+        content_text="连续发图",
+        content_data=[{"type": "text", "text": "连续发图"}],
+    )
+
+    assert (await runtime.handle_user_message(Context(), trigger)).name == "BLOCK_TRIGGER"
+    assert (await runtime.handle_user_message(Context(), background)).name == "CONTINUE"
+    scope = runtime.reply_scopes.get("group-scope")
+    assert scope is not None
+    assert scope.target_sender_id == "user-a"
+    prompt = await runtime.render_reply_scope_prompt(type("Ctx", (), {"chat_key": "group-scope"})())
+    assert '"sender_id":"user-a"' in prompt
+    assert "user-b" not in prompt
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_two_group_triggers_make_reply_scope_ambiguous() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    runtime.classifier.classify = lambda *_args: _result(False)  # type: ignore[method-assign]
+    first = Message(
+        chat_key="ambiguous-group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="amb-a",
+        is_tome=1,
+        content_text="@Bot A",
+        content_data=[{"type": "text", "text": "@Bot A"}],
+    )
+    second = Message(
+        chat_key="ambiguous-group",
+        chat_type="group",
+        sender_id="user-b",
+        message_id="amb-b",
+        is_tome=1,
+        content_text="@Bot B",
+        content_data=[{"type": "text", "text": "@Bot B"}],
+    )
+    await runtime.handle_user_message(None, first)
+    await runtime.handle_user_message(None, second)
+    scope = runtime.reply_scopes.get("ambiguous-group")
+    assert scope is not None and scope.state == "ambiguous"
+    prompt = await runtime.render_reply_scope_prompt(type("Ctx", (), {"chat_key": "ambiguous-group"})())
+    assert "不要指定、点名或 @ 任何成员" in prompt
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_group_trigger_after_previous_batch_replaces_expired_round_scope() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    runtime = DebounceRuntime(plugin, DebounceConfig(timeout_seconds=1, max_wait_seconds=5))
+    runtime.classifier.classify = lambda *_args: _result(True)  # type: ignore[method-assign]
+    first = Message(
+        chat_key="round-group",
+        chat_type="group",
+        sender_id="user-a",
+        message_id="round-a",
+        is_tome=1,
+        content_text="@Bot A",
+        content_data=[{"type": "text", "text": "@Bot A"}],
+    )
+    await runtime.handle_user_message(None, first)
+    old_buffer = runtime.buffers.get("round-group\x1fuser-a")
+    assert old_buffer is not None
+    old_buffer.quiet_deadline = time.time() - 1
+    await runtime._on_timeout(old_buffer.buffer_key, old_buffer.generation)
+    assert runtime.buffers.for_chat("round-group") == []
+
+    second = Message(
+        chat_key="round-group",
+        chat_type="group",
+        sender_id="user-b",
+        message_id="round-b",
+        is_tome=1,
+        content_text="@Bot B",
+        content_data=[{"type": "text", "text": "@Bot B"}],
+    )
+    await runtime.handle_user_message(None, second)
+    scope = runtime.reply_scopes.get("round-group")
+    assert scope is not None and scope.state == "active"
+    assert scope.target_sender_id == "user-b"
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_reply_scope_prompt_respects_enabled_and_usage_scope() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    context = type("Ctx", (), {"chat_key": "scope-config", "channel_type": "group"})()
+    runtime = DebounceRuntime(plugin, DebounceConfig(enabled=False))
+    runtime.reply_scopes.begin(
+        chat_key="scope-config",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="scope-config-1",
+        sender_id="user-a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    assert await runtime.render_reply_scope_prompt(context) == ""
+    await runtime.stop()
+
+    runtime = DebounceRuntime(plugin, DebounceConfig(usage_scope="group"))
+    runtime.reply_scopes.begin(
+        chat_key="scope-config",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="scope-config-3",
+        sender_id="user-a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    prompt = await runtime.render_reply_scope_prompt(context)
+    assert '"sender_id":"user-a"' in prompt
+    await runtime.stop()
+
+    runtime = DebounceRuntime(plugin, DebounceConfig(usage_scope="private"))
+    runtime.reply_scopes.begin(
+        chat_key="scope-config",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="scope-config-2",
+        sender_id="user-a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    assert await runtime.render_reply_scope_prompt(context) == ""
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_registered_reply_scope_prompt_fails_safe_on_exception() -> None:
+    import nekro_plugin_debounce as debounce_module
+
+    from nekro_plugin_debounce import plugin
+
+    original = debounce_module.runtime.render_reply_scope_prompt
+
+    async def fail(_ctx):
+        raise RuntimeError("prompt failure")
+
+    debounce_module.runtime.render_reply_scope_prompt = fail  # type: ignore[method-assign]
+    try:
+        prompt = await plugin.prompt_inject_method(type("Ctx", (), {"chat_key": "scope-error"})())
+    finally:
+        debounce_module.runtime.render_reply_scope_prompt = original  # type: ignore[method-assign]
+
+    assert '"state":"missing"' in prompt
+
+
+@pytest.mark.asyncio
 async def test_new_message_resets_quiet_deadline_only() -> None:
     from nekro_plugin_debounce import plugin
 
