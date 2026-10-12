@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nekro_plugin_debounce.scope import ReplyScopeStore
+from nekro_plugin_debounce.scope import ReplyScopeState, ReplyScopeStore
 
 
 def test_scope_keeps_same_sender_and_expires() -> None:
@@ -56,7 +56,7 @@ def test_different_trigger_sender_marks_scope_ambiguous() -> None:
         now=101,
     )
 
-    assert scope.state == "ambiguous"
+    assert scope.state == ReplyScopeState.AMBIGUOUS
     rendered = store.render("group")
     assert '"state":"ambiguous"' in rendered
     assert "不要指定、点名或 @ 任何成员" in rendered
@@ -78,3 +78,29 @@ def test_missing_and_canceled_scope_use_safe_prompt() -> None:
     store.cancel("group")
     assert '"state":"canceled"' in store.render("group")
     assert "不要指定、点名或 @ 任何成员" in store.render("group")
+
+
+def test_canceled_scope_can_be_replaced_by_a_new_trigger() -> None:
+    store = ReplyScopeStore()
+    store.begin(
+        chat_key="group",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="a1",
+        sender_id="a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    store.cancel("group")
+    scope = store.begin(
+        chat_key="group",
+        generation=2,
+        trigger_source="is_tome",
+        message_id="b1",
+        sender_id="b",
+        sender_name="B",
+        platform_userid="b",
+    )
+
+    assert scope.state == ReplyScopeState.ACTIVE
+    assert scope.target_sender_id == "b"

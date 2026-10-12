@@ -255,7 +255,6 @@ class DebounceRuntime:
             buffer = await self._buffer_message(message, current_buffer, internal_key)
             if buffer is None:
                 return MsgSignal.CONTINUE
-            self._update_reply_scope(message, buffer, trigger_match, trigger_source, current_buffer)
             preload_pending = self._preload_task is not None and not self._preload_task.done()
             preload_failed = self.classifier.load_error is not None
             if not self.classifier.is_ready and (preload_pending or preload_failed):
@@ -273,13 +272,16 @@ class DebounceRuntime:
                     return MsgSignal.CONTINUE
                 if not await self._apply_wait_policy(buffer):
                     return MsgSignal.CONTINUE
+                self._update_reply_scope(message, buffer, trigger_match, trigger_source, current_buffer)
                 return MsgSignal.BLOCK_TRIGGER
             if buffer.classifier_fallback:
+                self._update_reply_scope(message, buffer, trigger_match, trigger_source, current_buffer)
                 return MsgSignal.BLOCK_TRIGGER
 
             result = await self._classify_buffer(buffer)
             if result is not None and not await self._apply_wait_policy(buffer):
                 return MsgSignal.CONTINUE
+            self._update_reply_scope(message, buffer, trigger_match, trigger_source, current_buffer)
             return MsgSignal.BLOCK_TRIGGER
 
     async def _buffer_message(
@@ -955,6 +957,8 @@ class DebounceRuntime:
     async def render_reply_scope_prompt(self, ctx: Any) -> str:
         """渲染短期回复目标约束；失败时返回安全降级文本，不阻塞 Agent。"""
 
+        if not self._scope_allowed_for_context(ctx):
+            return ""
         chat_key = str(getattr(ctx, "chat_key", "") or "")
         if not chat_key:
             self.logger.warning("[Debounce] 回复范围缺少 chat_key，使用安全降级提示")
@@ -971,6 +975,19 @@ class DebounceRuntime:
                 f"generation={scope.generation}",
             )
         return self.reply_scopes.render(chat_key)
+
+    def _scope_allowed_for_context(self, ctx: Any) -> bool:
+        """让提示注入遵守插件自身的启用状态和使用范围。"""
+
+        if not bool(getattr(self.config, "enabled", False)):
+            return False
+        usage_scope = str(getattr(self.config, "usage_scope", "both") or "both")
+        if usage_scope == "both":
+            return True
+        channel_type = getattr(ctx, "channel_type", None)
+        channel_type = getattr(channel_type, "value", channel_type)
+        channel_type = str(channel_type or "").lower()
+        return channel_type == usage_scope
 
     async def _schedule_agent_from_history(self, buffer: ChatBuffer) -> None:
         """从已落库历史调度 Agent，并保留原始触发消息的执行上下文。"""

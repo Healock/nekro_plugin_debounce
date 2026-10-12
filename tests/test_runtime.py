@@ -351,6 +351,39 @@ async def test_new_group_trigger_after_previous_batch_replaces_expired_round_sco
 
 
 @pytest.mark.asyncio
+async def test_reply_scope_prompt_respects_enabled_and_usage_scope() -> None:
+    from nekro_plugin_debounce import plugin
+
+    plugin.store.data.clear()
+    context = type("Ctx", (), {"chat_key": "scope-config", "channel_type": "group"})()
+    runtime = DebounceRuntime(plugin, DebounceConfig(enabled=False))
+    runtime.reply_scopes.begin(
+        chat_key="scope-config",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="scope-config-1",
+        sender_id="user-a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    assert await runtime.render_reply_scope_prompt(context) == ""
+    await runtime.stop()
+
+    runtime = DebounceRuntime(plugin, DebounceConfig(usage_scope="private"))
+    runtime.reply_scopes.begin(
+        chat_key="scope-config",
+        generation=1,
+        trigger_source="is_tome",
+        message_id="scope-config-2",
+        sender_id="user-a",
+        sender_name="A",
+        platform_userid="a",
+    )
+    assert await runtime.render_reply_scope_prompt(context) == ""
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_new_message_resets_quiet_deadline_only() -> None:
     from nekro_plugin_debounce import plugin
 

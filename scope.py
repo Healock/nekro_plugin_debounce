@@ -10,10 +10,19 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 
 SCOPE_TTL_SECONDS = 180.0
+
+
+class ReplyScopeState(StrEnum):
+    """回复范围的生命周期状态。"""
+
+    ACTIVE = "active"
+    CANCELED = "canceled"
+    AMBIGUOUS = "ambiguous"
 
 
 @dataclass(slots=True)
@@ -30,17 +39,17 @@ class ReplyScope:
     platform_userid: str
     created_at: float
     expires_at: float
-    state: str = "active"
+    state: ReplyScopeState = ReplyScopeState.ACTIVE
 
     def expired(self, now: float | None = None) -> bool:
         return (time.time() if now is None else now) >= self.expires_at
 
     def cancel(self) -> None:
-        self.state = "canceled"
+        self.state = ReplyScopeState.CANCELED
         self.expires_at = min(self.expires_at, time.time())
 
     def mark_ambiguous(self) -> None:
-        self.state = "ambiguous"
+        self.state = ReplyScopeState.AMBIGUOUS
 
 
 class ReplyScopeStore:
@@ -72,16 +81,21 @@ class ReplyScopeStore:
         now: float | None = None,
     ) -> ReplyScope:
         now = time.time() if now is None else now
-        existing = self.get(chat_key, now=now)
+        existing = self._scopes.get(chat_key)
+        if existing is not None and (
+            existing.state == ReplyScopeState.CANCELED or existing.expired(now)
+        ):
+            self._scopes.pop(chat_key, None)
+            existing = None
         if existing is not None:
             same_sender = bool(sender_id) and sender_id == existing.target_sender_id
-            if same_sender and existing.state == "active":
+            if same_sender and existing.state == ReplyScopeState.ACTIVE:
                 existing.generation = generation
                 existing.representative_message_id = message_id or existing.representative_message_id
                 existing.trigger_source = trigger_source or existing.trigger_source
                 existing.expires_at = now + self.ttl_seconds
                 return existing
-            if existing.state != "ambiguous":
+            if existing.state != ReplyScopeState.AMBIGUOUS:
                 existing.mark_ambiguous()
             existing.expires_at = now + self.ttl_seconds
             return existing
@@ -115,7 +129,7 @@ class ReplyScopeStore:
 
     def render(self, chat_key: str) -> str:
         scope = self._scopes.get(chat_key)
-        if scope is not None and scope.state == "active" and scope.expired():
+        if scope is not None and scope.state == ReplyScopeState.ACTIVE and scope.expired():
             self._scopes.pop(chat_key, None)
             scope = None
         if scope is None:
@@ -130,14 +144,14 @@ class ReplyScopeStore:
             "generation": scope.generation,
             "trigger_source": scope.trigger_source,
         }
-        if scope.state == "active":
+        if scope.state == ReplyScopeState.ACTIVE:
             payload["target"] = {
                 "sender_id": scope.target_sender_id,
                 "sender_name": scope.target_sender_name,
                 "platform_userid": scope.platform_userid,
             }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        if scope.state == "active":
+        if scope.state == ReplyScopeState.ACTIVE:
             guidance = (
                 "当前回合优先处理明确触发 Bot 的目标消息。其他成员的消息仅作背景；不能因为某人最近发言、连续发图或位于历史末尾就主动点名、@、追问或评价该成员。"
                 "只有明确 @Bot、回复 Bot、称呼 Bot，或属于当前目标发送者的续写，才可视为回复对象；不必每次称呼目标姓名。"
@@ -149,4 +163,4 @@ class ReplyScopeStore:
         return f"[Debounce reply scope]\n{encoded}\n{guidance}"
 
 
-__all__ = ["ReplyScope", "ReplyScopeStore", "SCOPE_TTL_SECONDS"]
+__all__ = ["ReplyScope", "ReplyScopeState", "ReplyScopeStore", "SCOPE_TTL_SECONDS"]
