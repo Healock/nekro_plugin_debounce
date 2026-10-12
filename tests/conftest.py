@@ -69,6 +69,9 @@ class _Plugin:
     def mount_on_channel_reset(self):
         return lambda func: func
 
+    def mount_prompt_inject_method(self, **_kwargs: Any):
+        return lambda func: func
+
     def get_plugin_data_dir(self) -> Path:
         return self._data_dir
 

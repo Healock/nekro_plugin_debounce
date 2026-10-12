@@ -23,6 +23,7 @@ from .compat import (
     usage_scope_matches,
 )
 from .journal import JournalError, JournalStore
+from .scope import ReplyScopeStore
 from .state import ChatBuffer, JournalRecord, JournalState, MessageEnvelope, SemanticState
 from .tasks import TaskManager
 
@@ -42,6 +43,7 @@ class DebounceRuntime:
             data_dir=plugin.get_plugin_data_dir(),
         )
         self.tasks = TaskManager(self._on_timeout, logger=plugin.logger)
+        self.reply_scopes = ReplyScopeStore()
         self._started = False
         self._stopping = False
         self._preload_task: asyncio.Task[None] | None = None
@@ -164,6 +166,7 @@ class DebounceRuntime:
 
     async def stop(self) -> None:
         self._stopping = True
+        self.reply_scopes.clear_all()
         if self._preload_task is not None and not self._preload_task.done():
             self._preload_task.cancel()
             await asyncio.gather(self._preload_task, return_exceptions=True)
@@ -176,6 +179,7 @@ class DebounceRuntime:
         if not chat_key:
             return
         async with self.buffers.lock_for(chat_key):
+            self.reply_scopes.cancel(chat_key)
             buffers = self.buffers.for_chat(chat_key)
             generations = [buffer.generation for buffer in buffers]
             try:
@@ -251,6 +255,7 @@ class DebounceRuntime:
             buffer = await self._buffer_message(message, current_buffer, internal_key)
             if buffer is None:
                 return MsgSignal.CONTINUE
+            self._update_reply_scope(message, buffer, trigger_match, trigger_source, current_buffer)
             preload_pending = self._preload_task is not None and not self._preload_task.done()
             preload_failed = self.classifier.load_error is not None
             if not self.classifier.is_ready and (preload_pending or preload_failed):
@@ -713,6 +718,7 @@ class DebounceRuntime:
             for buffer in buffers:
                 self.tasks.cancel(buffer.buffer_key, buffer.generation)
                 self.buffers.clear(buffer.buffer_key, buffer.generation)
+            self.reply_scopes.cancel(chat_key)
             self.buffers.invalidate_chat(chat_key, generations)
             self.logger.info(
                 f"[Debounce] 频道批次已失效: chat={self._debug_chat_key(chat_key)} "
@@ -764,6 +770,7 @@ class DebounceRuntime:
             )
             return None
         if not bool(getattr(channel, "is_active", False)) or bool(getattr(channel, "observe_mode", False)):
+            self.reply_scopes.cancel(current.chat_key)
             try:
                 await self.journal.cancel(record_ids, f"{reason}:channel_inactive_or_observe")
             except JournalError:
@@ -781,6 +788,18 @@ class DebounceRuntime:
             )
             return None
 
+        # 恢复后的 pending 批次可能没有进程内 scope；释放前从批次首条
+        # 原始消息恢复结构化目标，避免 Agent 回合退化为依赖历史末条消息猜测。
+        first_message = current.messages[0]
+        self.reply_scopes.begin(
+            chat_key=current.chat_key,
+            generation=current.generation,
+            trigger_source="restored_batch",
+            message_id=first_message.message_id,
+            sender_id=first_message.sender_id,
+            sender_name=first_message.sender_name or first_message.sender_nickname,
+            platform_userid=first_message.platform_userid,
+        )
         await self.journal.update_batch(record_ids, release_reason=reason)
         await self.journal.mark_flushing(record_ids)
         taken = self.buffers.take(current.buffer_key, current.generation)
@@ -880,6 +899,7 @@ class DebounceRuntime:
             await self._schedule_agent_from_history(taken)
         except Exception as exc:
             self.logger.exception(f"[Debounce] timeout 历史调度失败，保留人工恢复记录: {exc}")
+            self.reply_scopes.cancel(buffer.chat_key)
             try:
                 await self.journal.mark_manual_recovery(record_ids, f"history_dispatch_failed:{reason}")
             except JournalError:
@@ -895,6 +915,62 @@ class DebounceRuntime:
                 f"[Debounce] release_reason={reason} dispatch=history "
                 f"pending_messages={len(taken.messages)}",
             )
+
+    def _update_reply_scope(
+        self,
+        message: Any,
+        buffer: ChatBuffer,
+        trigger_match: bool,
+        trigger_source: str,
+        previous_buffer: ChatBuffer | None,
+    ) -> None:
+        """只为合法触发消息或其同发送者续写建立回复范围。"""
+
+        is_private = not self._is_group_message(message)
+        is_continuation = previous_buffer is not None and previous_buffer.sender_bucket == buffer.sender_bucket
+        if not is_private and not trigger_match and not is_continuation:
+            return
+        # 没有任何旧 pending 批次时，新的合法触发代表新的回合；不能把
+        # 上一回合仍在 TTL 内的目标误判成跨发送者并发歧义。
+        if trigger_match and previous_buffer is None:
+            pending = self.buffers.for_chat(buffer.chat_key)
+            if all(item.buffer_key == buffer.buffer_key for item in pending):
+                self.reply_scopes.clear(buffer.chat_key)
+        source = trigger_source if trigger_match else "same_sender_continuation"
+        scope = self.reply_scopes.begin(
+            chat_key=buffer.chat_key,
+            generation=buffer.generation,
+            trigger_source=source,
+            message_id=buffer.messages[0].message_id,
+            sender_id=buffer.messages[0].sender_id,
+            sender_name=buffer.messages[0].sender_name or buffer.messages[0].sender_nickname,
+            platform_userid=buffer.messages[0].platform_userid,
+        )
+        if scope.state == "ambiguous":
+            self.logger.warning(
+                f"[Debounce] 回复范围存在多发送者歧义: chat={self._debug_chat_key(buffer.chat_key)} "
+                f"generation={buffer.generation} state=ambiguous",
+            )
+
+    async def render_reply_scope_prompt(self, ctx: Any) -> str:
+        """渲染短期回复目标约束；失败时返回安全降级文本，不阻塞 Agent。"""
+
+        chat_key = str(getattr(ctx, "chat_key", "") or "")
+        if not chat_key:
+            self.logger.warning("[Debounce] 回复范围缺少 chat_key，使用安全降级提示")
+            return self.reply_scopes.render("")
+        scope = self.reply_scopes.get(chat_key)
+        state = "missing" if scope is None else scope.state
+        if state in {"missing", "ambiguous", "canceled"}:
+            self.logger.info(
+                f"[Debounce] reply_scope_{state}: chat={self._debug_chat_key(chat_key)}",
+            )
+        else:
+            self.logger.debug(
+                f"[Debounce] reply_scope_injected: chat={self._debug_chat_key(chat_key)} "
+                f"generation={scope.generation}",
+            )
+        return self.reply_scopes.render(chat_key)
 
     async def _schedule_agent_from_history(self, buffer: ChatBuffer) -> None:
         """从已落库历史调度 Agent，并保留原始触发消息的执行上下文。"""
@@ -938,6 +1014,17 @@ def register_lifecycle(plugin: Any, runtime: DebounceRuntime) -> None:
     @plugin.mount_cleanup_method()
     async def _cleanup() -> None:
         await runtime.stop()
+
+    @plugin.mount_prompt_inject_method(
+        name="回复范围约束",
+        description="提示当前回合的明确触发者，避免将群聊背景消息误认为回复对象。",
+    )
+    async def _reply_scope_prompt(ctx: Any) -> str:
+        try:
+            return await runtime.render_reply_scope_prompt(ctx)
+        except Exception as exc:
+            runtime.logger.warning(f"[Debounce] 回复范围提示注入失败，使用安全降级提示: {type(exc).__name__}")
+            return runtime.reply_scopes.render("")
 
     @plugin.mount_on_channel_reset()
     async def _on_channel_reset(ctx: Any) -> None:
