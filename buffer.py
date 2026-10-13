@@ -128,6 +128,11 @@ class BufferManager:
         classification_count: int = 0,
         selected_wait_seconds: float = 0.0,
         classifier_fallback: bool = False,
+        media_wait_mode: bool = False,
+        media_hint_id: str = "",
+        media_handle_id: str = "",
+        media_type: str = "",
+        media_hint_expires_at: float = 0.0,
     ) -> None:
         grouped: dict[tuple[str, int], list[MessageEnvelope]] = {}
         for envelope in envelopes:
@@ -159,6 +164,11 @@ class BufferManager:
                 classification_count=classification_count,
                 selected_wait_seconds=selected_wait_seconds,
                 classifier_fallback=classifier_fallback,
+                media_wait_mode=media_wait_mode,
+                media_hint_id=media_hint_id,
+                media_handle_id=media_handle_id,
+                media_type=media_type,
+                media_hint_expires_at=media_hint_expires_at,
             )
             self._buffers[buffer.buffer_key] = buffer
 

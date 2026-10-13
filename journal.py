@@ -162,6 +162,11 @@ class JournalStore:
             "classification_count",
             "selected_wait_seconds",
             "classifier_fallback",
+            "media_wait_mode",
+            "media_hint_id",
+            "media_handle_id",
+            "media_type",
+            "media_hint_expires_at",
             "release_reason",
         }
         unknown = set(updates) - allowed
