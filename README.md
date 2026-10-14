@@ -1,6 +1,6 @@
 # NekroAgent 消息防抖
 
-版本：`0.5.2`
+版本：`0.5.3`
 
 本插件移植自 AstrBot 插件 `astrbot_plugin_debounce`。
 
@@ -46,6 +46,12 @@
 现有 Nekro 配置不会自动导入 AstrBot 配置文件。`_conf_schema.json` 的 `0.8/10` 是迁移默认值；AstrBot README 与源码中的 `0.5/30` fallback 不作为新配置默认值。
 
 ## 消息边界
+
+Media 插件在成功创建音视频句柄后，会通过版本化 capability 发布一次性媒体 hint，绑定
+`adapter_key`、`chat_key`、原始 `message_id` 和句柄 ID。收到该 hint 的批次会记录
+`semantic_probability=0` 作为兼容观测字段，并进入 `media_wait_mode`：不再调用文本完整性模型，
+等待该批次的 `max_wait_seconds` 截止时间后释放。媒体批次可以继续接收同一发送者的补充文字，
+不同发送者仍不会合并。hint 缺失或过期时不会猜测媒体身份，继续使用普通媒体边界逻辑。
 
 - `mount_on_user_message` 能看到的命令、`is_tome` 和显式 @ 不会在插件内额外绕过；上游已经消费、没有进入回调的命令不由本插件处理。
 - 群聊按“频道 + 发送者”分别维护防抖批次，不同发送者不会进入同一批次；同一发送者的连续消息仍按原策略累计分类。释放时 Agent 读取频道历史，因此其他消息仍可能作为上下文，但插件不会把它们伪造成触发者的合成消息。私聊按用户频道独立缓冲。

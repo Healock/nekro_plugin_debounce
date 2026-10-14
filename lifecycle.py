@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from nekro_agent.schemas.signal import MsgSignal
@@ -48,6 +49,7 @@ class DebounceRuntime:
         self._stopping = False
         self._preload_task: asyncio.Task[None] | None = None
         self._timeout_state_failures: dict[tuple[str, int], int] = {}
+        self._media_hints: dict[tuple[str, str, str], dict[str, object]] = {}
 
     @property
     def logger(self) -> Any:
@@ -125,6 +127,7 @@ class DebounceRuntime:
             quiet_deadline = max(record.quiet_deadline or record.timeout_at for record in batch)
             quiet_deadline = min(quiet_deadline or max_wait_deadline, max_wait_deadline)
             latest = batch[-1]
+            latest_media = next((record for record in reversed(batch) if record.media_handle_id), latest)
             self.buffers.restore(
                 envelopes,
                 quiet_deadline,
@@ -142,6 +145,11 @@ class DebounceRuntime:
                 classification_count=latest.classification_count,
                 selected_wait_seconds=latest.selected_wait_seconds,
                 classifier_fallback=any(record.classifier_fallback for record in batch),
+                media_wait_mode=any(record.media_wait_mode for record in batch),
+                media_hint_id=latest_media.media_hint_id,
+                media_handle_id=latest_media.media_handle_id,
+                media_type=latest_media.media_type,
+                media_hint_expires_at=latest_media.media_hint_expires_at,
             )
             try:
                 self.tasks.schedule(internal_key, generation, quiet_deadline)
@@ -167,12 +175,58 @@ class DebounceRuntime:
     async def stop(self) -> None:
         self._stopping = True
         self.reply_scopes.clear_all()
+        self._media_hints.clear()
         if self._preload_task is not None and not self._preload_task.done():
             self._preload_task.cancel()
             await asyncio.gather(self._preload_task, return_exceptions=True)
         self._preload_task = None
         await self.tasks.cancel_all()
         self._started = False
+
+    def publish_media_hint(self, payload: Any) -> bool:
+        """Receive one short-lived media hint from the Media plugin."""
+
+        if not isinstance(payload, Mapping) or payload.get("version") != 1:
+            return False
+        adapter_key = str(payload.get("adapter_key") or "")
+        chat_key = str(payload.get("chat_key") or "")
+        source_message_id = str(payload.get("message_id") or "")
+        media_handle_id = str(payload.get("media_handle_id") or "")
+        expires_at = float(payload.get("expires_at") or 0.0)
+        if not adapter_key or not chat_key or not source_message_id or not media_handle_id:
+            return False
+        if expires_at <= time.time():
+            return False
+        now = time.time()
+        self._media_hints = {
+            hint_key: hint
+            for hint_key, hint in self._media_hints.items()
+            if float(hint.get("expires_at") or 0.0) > now
+        }
+        key = (adapter_key, chat_key, source_message_id)
+        self._media_hints[key] = {
+            "hint_id": str(payload.get("hint_id") or f"media:{source_message_id}:{media_handle_id}"),
+            "adapter_key": adapter_key,
+            "chat_key": chat_key,
+            "message_id": source_message_id,
+            "media_handle_id": media_handle_id,
+            "media_type": str(payload.get("media_type") or "unknown"),
+            "expires_at": expires_at,
+        }
+        while len(self._media_hints) > 2048:
+            self._media_hints.pop(next(iter(self._media_hints)))
+        return True
+
+    def _consume_media_hint(self, message: Any) -> dict[str, object] | None:
+        key = (
+            str(getattr(message, "adapter_key", "") or ""),
+            str(getattr(message, "chat_key", "") or ""),
+            message_id(message),
+        )
+        hint = self._media_hints.pop(key, None)
+        if hint is None or float(hint.get("expires_at") or 0.0) <= time.time():
+            return None
+        return hint
 
     async def reset_channel(self, ctx: Any) -> None:
         chat_key = str(getattr(ctx, "chat_key", "") or "")
@@ -234,11 +288,12 @@ class DebounceRuntime:
         async with lock:
             current_buffer = self.buffers.get(internal_key)
             trigger_match, trigger_source = await self._trigger_match(_ctx, message)
+            media_hint = self._consume_media_hint(message)
             asyncio.create_task(
                 self._observe_trigger_scope(_ctx, message, current_buffer, trigger_match, trigger_source),
                 name="debounce-trigger-scope-observation",
             )
-            if has_hard_boundary(message):
+            if has_hard_boundary(message) and media_hint is None:
                 if current_buffer is None or not current_buffer.messages:
                     return MsgSignal.CONTINUE
                 return await self._merge_and_trigger(message, current_buffer, "media_boundary")
@@ -252,9 +307,14 @@ class DebounceRuntime:
             if self._is_group_message(message) and current_buffer is None and not trigger_match:
                 return MsgSignal.CONTINUE
 
-            buffer = await self._buffer_message(message, current_buffer, internal_key)
+            buffer = await self._buffer_message(message, current_buffer, internal_key, media_hint=media_hint)
             if buffer is None:
                 return MsgSignal.CONTINUE
+            if buffer.media_wait_mode:
+                if not await self._apply_wait_policy(buffer):
+                    return MsgSignal.CONTINUE
+                self._update_reply_scope(message, buffer, trigger_match, trigger_source, current_buffer)
+                return MsgSignal.BLOCK_TRIGGER
             preload_pending = self._preload_task is not None and not self._preload_task.done()
             preload_failed = self.classifier.load_error is not None
             if not self.classifier.is_ready and (preload_pending or preload_failed):
@@ -289,6 +349,8 @@ class DebounceRuntime:
         message: Any,
         current_buffer: ChatBuffer | None,
         internal_key: str,
+        *,
+        media_hint: dict[str, object] | None = None,
     ) -> ChatBuffer | None:
         """持久化一条消息，重置静默窗口但不延长最大等待时间。"""
 
@@ -307,6 +369,11 @@ class DebounceRuntime:
             semantic_state = None
             semantic_checked_at = 0.0
             classification_count = 0
+            media_wait_mode = media_hint is not None
+            media_hint_id = str(media_hint.get("hint_id") or "") if media_hint else ""
+            media_handle_id = str(media_hint.get("media_handle_id") or "") if media_hint else ""
+            media_type = str(media_hint.get("media_type") or "") if media_hint else ""
+            media_hint_expires_at = float(media_hint.get("expires_at") or 0.0) if media_hint else 0.0
         else:
             generation = current_buffer.generation
             sequence = len(current_buffer.messages)
@@ -320,7 +387,24 @@ class DebounceRuntime:
             semantic_state = current_buffer.semantic_state
             semantic_checked_at = current_buffer.semantic_checked_at
             classification_count = current_buffer.classification_count
-        quiet_deadline = min(now + self.quiet_seconds, max_wait_deadline)
+            media_wait_mode = current_buffer.media_wait_mode or media_hint is not None
+            media_hint_id = current_buffer.media_hint_id
+            media_handle_id = current_buffer.media_handle_id
+            media_type = current_buffer.media_type
+            media_hint_expires_at = current_buffer.media_hint_expires_at
+            if media_hint is not None:
+                media_hint_id = str(media_hint.get("hint_id") or media_hint_id)
+                media_handle_id = str(media_hint.get("media_handle_id") or media_handle_id)
+                media_type = str(media_hint.get("media_type") or media_type)
+                media_hint_expires_at = float(media_hint.get("expires_at") or media_hint_expires_at)
+        if media_wait_mode:
+            semantic_complete = False
+            semantic_probability = 0.0
+            semantic_state = SemanticState.INCOMPLETE
+            semantic_checked_at = now
+            quiet_deadline = max_wait_deadline
+        else:
+            quiet_deadline = min(now + self.quiet_seconds, max_wait_deadline)
         event_id = message_event_id(message)
         record = JournalRecord(
             event_id=event_id,
@@ -350,8 +434,13 @@ class DebounceRuntime:
             semantic_state=semantic_state,
             semantic_checked_at=semantic_checked_at,
             classification_count=classification_count,
-            selected_wait_seconds=self.quiet_seconds,
+            selected_wait_seconds=max_wait_deadline - now if media_wait_mode else self.quiet_seconds,
             classifier_fallback=classifier_fallback,
+            media_wait_mode=media_wait_mode,
+            media_hint_id=str(media_hint.get("hint_id") or "") if media_hint else "",
+            media_handle_id=str(media_hint.get("media_handle_id") or "") if media_hint else "",
+            media_type=str(media_hint.get("media_type") or "") if media_hint else "",
+            media_hint_expires_at=float(media_hint.get("expires_at") or 0.0) if media_hint else 0.0,
         )
         try:
             await self.journal.append(record)
@@ -403,7 +492,17 @@ class DebounceRuntime:
         buffer.semantic_state = semantic_state
         buffer.semantic_checked_at = semantic_checked_at
         buffer.classification_count = classification_count
-        buffer.selected_wait_seconds = self.quiet_seconds
+        buffer.media_wait_mode = media_wait_mode
+        buffer.media_hint_id = media_hint_id
+        buffer.media_handle_id = media_handle_id
+        buffer.media_type = media_type
+        buffer.media_hint_expires_at = media_hint_expires_at
+        buffer.semantic_complete = semantic_complete
+        buffer.semantic_probability = semantic_probability
+        buffer.semantic_state = semantic_state
+        buffer.semantic_checked_at = semantic_checked_at
+        selected_wait_seconds = max_wait_deadline - now if media_wait_mode else self.quiet_seconds
+        buffer.selected_wait_seconds = selected_wait_seconds
         try:
             await self.journal.update_batch(
                 buffer.record_ids,
@@ -411,8 +510,9 @@ class DebounceRuntime:
                 quiet_deadline=quiet_deadline,
                 timeout_at=quiet_deadline,
                 max_wait_deadline=max_wait_deadline,
-                selected_wait_seconds=self.quiet_seconds,
+                selected_wait_seconds=selected_wait_seconds,
                 classifier_fallback=classifier_fallback,
+                media_wait_mode=media_wait_mode,
             )
         except JournalError as exc:
             self.logger.exception(f"[Debounce] 保存批次截止时间失败，当前消息放行: {exc}")
@@ -439,6 +539,8 @@ class DebounceRuntime:
         return buffer
 
     async def _classify_buffer(self, buffer: ChatBuffer) -> ClassificationResult | None:
+        if buffer.media_wait_mode:
+            return None
         previous_probability = buffer.semantic_probability
         try:
             result = await self.classifier.classify(
@@ -522,6 +624,8 @@ class DebounceRuntime:
         return "none" if probability is None else f"{probability:.4f}"
 
     def _wait_seconds_for(self, buffer: ChatBuffer) -> tuple[float, str, float | None]:
+        if buffer.media_wait_mode:
+            return max(0.0, buffer.max_wait_deadline - time.time()), "media_max_wait", None
         if len(buffer.messages) > 1 and buffer.semantic_state == SemanticState.COMPLETE_HIGH:
             recent_intervals = buffer.recent_message_intervals[-3:]
             cadence_interval = max(recent_intervals, default=0.0)
@@ -841,7 +945,12 @@ class DebounceRuntime:
                 return
 
             reason: str | None = None
-            if buffer.classifier_fallback:
+            if buffer.media_wait_mode:
+                if time.time() < buffer.max_wait_deadline:
+                    self.tasks.schedule(internal_key, generation, buffer.max_wait_deadline)
+                    return
+                reason = "media_max_wait_fallback"
+            elif buffer.classifier_fallback:
                 reason = "classifier_unavailable_time_fallback"
             else:
                 result = await self._classify_buffer(buffer)

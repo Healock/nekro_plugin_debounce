@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 CAPABILITY_VERSION = 1
+MEDIA_HINT_CAPABILITY_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class DebounceBridge:
 
     runtime: Any
     version: int = CAPABILITY_VERSION
+    media_hint_version: int = MEDIA_HINT_CAPABILITY_VERSION
 
     async def invalidate_channel(
         self,
@@ -50,3 +52,11 @@ class DebounceBridge:
             batch_count=1 if invalidated else 0,
             reason="invalidated" if invalidated else "no_pending_batch",
         )
+
+    def publish_media_hint(self, payload: Mapping[str, object]) -> bool:
+        """Publish a one-shot Media hint without coupling plugin imports."""
+
+        try:
+            return bool(self.runtime.publish_media_hint(payload))
+        except Exception:
+            return False

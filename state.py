@@ -62,6 +62,11 @@ class JournalRecord(BaseModel):
     classification_count: int = 0
     selected_wait_seconds: float = 0.0
     classifier_fallback: bool = False
+    media_wait_mode: bool = False
+    media_hint_id: str = ""
+    media_handle_id: str = ""
+    media_type: str = ""
+    media_hint_expires_at: float = 0.0
     release_reason: str = ""
     retries: int = 0
     error_state: str = ""
@@ -124,6 +129,11 @@ class ChatBuffer:
     classification_count: int = 0
     selected_wait_seconds: float = 0.0
     classifier_fallback: bool = False
+    media_wait_mode: bool = False
+    media_hint_id: str = ""
+    media_handle_id: str = ""
+    media_type: str = ""
+    media_hint_expires_at: float = 0.0
 
     @property
     def record_ids(self) -> list[str]:
